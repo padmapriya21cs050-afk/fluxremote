@@ -1,0 +1,8 @@
+{
+  "name": "FluxRemote Workspace",
+  "description": "High-speed secure remote desktop signaling, socket relays, and Windows clients control suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
