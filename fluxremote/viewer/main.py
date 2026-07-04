@@ -5,16 +5,18 @@ A high-performance thread-safe PySide6 GUI application for remote desktop viewin
 device discovery, authentication, and secure relay control.
 """
 
+import os
 import sys
 import json
 import logging
 import threading
 import time
 from typing import Optional, Dict, Any
+from urllib.parse import quote
 
 # Qt Imports
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, Slot, QByteArray, QBuffer, QIODevice
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QByteArray, QBuffer, QIODevice, QTimer
     from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QLineEdit, QPushButton, QLabel, QListWidget,
                                  QListWidgetItem, QMessageBox, QSlider, QStatusBar, QSplitter)
@@ -31,22 +33,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] View
 logger = logging.getLogger("fluxremote.viewer")
 
 class WSClientThread(QThread):
-    """Background thread that manages continuous WebSocket connection to relay server,
-    emitting frames and status updates back to the Qt Main Thread safely."""
+    """Background thread that manages the screen stream WebSocket connection."""
     
     frame_received = Signal(bytes)
     status_updated = Signal(str)
     connection_lost = Signal()
     
-    def __init__(self, ws_url: str, device_id: str):
+    def __init__(self, ws_url: str, device_id: str, auth_token: Optional[str] = None):
         super().__init__()
         self.ws_url = ws_url
         self.device_id = device_id
+        self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
         self.ws: Optional[websocket.WebSocketApp] = None
         self.running = True
         
+    def _build_ws_endpoint(self, path: str) -> str:
+        url = f"{self.ws_url}{path}"
+        if not self.auth_token:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}token={quote(self.auth_token)}"
+        
     def run(self):
-        ws_endpoint = f"{self.ws_url}/ws/viewer/{self.device_id}"
+        ws_endpoint = self._build_ws_endpoint(f"/ws/viewer/{self.device_id}")
         logger.info(f"Connecting viewer WebSocket: {ws_endpoint}")
         self.status_updated.emit("Establishing secure link...")
         
@@ -108,14 +117,91 @@ class WSClientThread(QThread):
         logger.error(f"Viewer socket error: {error}")
         self.status_updated.emit(f"Error: {error}")
 
+    def stop(self):
+        self.running = False
+        if self.ws:
+            self.ws.close()
+        self.wait()
+
+
+class ControlWSClientThread(QThread):
+    """Dedicated low-latency WebSocket tunnel for mouse, keyboard, and clipboard input."""
+
+    status_updated = Signal(str)
+
+    def __init__(self, ws_url: str, device_id: str, auth_token: Optional[str] = None):
+        super().__init__()
+        self.ws_url = ws_url
+        self.device_id = device_id
+        self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.running = True
+
+    def _build_ws_endpoint(self, path: str) -> str:
+        url = f"{self.ws_url}{path}"
+        if not self.auth_token:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}token={quote(self.auth_token)}"
+
+    def run(self):
+        ws_endpoint = self._build_ws_endpoint(f"/ws/control/{self.device_id}")
+        logger.info(f"Connecting control tunnel: {ws_endpoint}")
+        self.status_updated.emit("Control tunnel connecting...")
+
+        while self.running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    ws_endpoint,
+                    on_open=self.on_open,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                )
+                self.ws.run_forever()
+            except Exception as e:
+                logger.error(f"Control tunnel loop error: {e}")
+                self.status_updated.emit("Control tunnel error.")
+
+            if self.running:
+                time.sleep(1)
+
+    def on_open(self, ws):
+        logger.info("Control tunnel linked to relay.")
+        self.status_updated.emit("Control tunnel ready.")
+
+    def on_close(self, ws, code, msg):
+        logger.warning(f"Control tunnel disconnected: {code} - {msg}")
+
+    def on_error(self, ws, error):
+        logger.error(f"Control tunnel socket error: {error}")
+
+    def __init__(self, ws_url: str, device_id: str, auth_token: Optional[str] = None):
+        super().__init__()
+        self.ws_url = ws_url
+        self.device_id = device_id
+        self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.running = True
+        self._input_latency_samples = []
+
     def send_action(self, msg_type: str, payload: dict):
-        """Send JSON keystroke/mouse actions from GUI thread to WS connection."""
         if self.ws and self.ws.sock and self.ws.sock.connected:
             try:
+                # Keep input traffic on the dedicated control tunnel so it bypasses screen-frame backpressure.
+                send_started = time.perf_counter()
                 packet = json.dumps({"type": msg_type, "payload": payload})
                 self.ws.send(packet)
+                latency_ms = (time.perf_counter() - send_started) * 1000.0
+                self._record_input_latency(latency_ms)
             except Exception as e:
-                logger.error(f"Failed to send viewer event packet: {e}")
+                logger.error(f"Failed to send control packet: {e}")
+
+    def _record_input_latency(self, latency_ms: float):
+        self._input_latency_samples.append(latency_ms)
+        if len(self._input_latency_samples) >= 20:
+            average_ms = sum(self._input_latency_samples) / len(self._input_latency_samples)
+            logger.info("Average control-tunnel send latency: %.2f ms", average_ms)
+            self._input_latency_samples.clear()
 
     def stop(self):
         self.running = False
@@ -138,6 +224,15 @@ class DesktopCanvas(QLabel):
         self.setScaledContents(True)
         self.setMinimumSize(800, 450)
 
+        # Coalesce mouse movement updates to a ~12 ms cadence and interpolate between points for smoother motion.
+        self._pending_mouse_move = None
+        self._mouse_move_target = None
+        self._last_mouse_send_position = None
+        self._mouse_move_timer = QTimer(self)
+        self._mouse_move_timer.setSingleShot(True)
+        self._mouse_move_timer.timeout.connect(self._flush_pending_mouse_move)
+        self._last_mouse_send_time = 0.0
+
     def update_resolution(self, width: int, height: int):
         self.original_width = width
         self.original_height = height
@@ -150,10 +245,42 @@ class DesktopCanvas(QLabel):
 
     def mouseMoveEvent(self, event: QMouseEvent):
         rx, ry = self._map_coordinates(event.position().x(), event.position().y())
-        self.action_triggered.emit("mouse_move", {"x": rx, "y": ry})
+        now = time.time()
+        # Queue the latest mouse target; moves are throttled to ~12 ms and smoothed with interpolation.
+        self._mouse_move_target = (rx, ry)
+
+        if now - self._last_mouse_send_time >= 0.012:
+            self._last_mouse_send_time = now
+            self._flush_pending_mouse_move()
+        elif not self._mouse_move_timer.isActive():
+            self._mouse_move_timer.start(12)
         event.accept()
 
+    def _flush_pending_mouse_move(self):
+        if self._mouse_move_target is None:
+            return
+
+        target_x, target_y = self._mouse_move_target
+        if self._last_mouse_send_position is None:
+            send_position = (target_x, target_y)
+        else:
+            last_x, last_y = self._last_mouse_send_position
+            # Interpolate halfway to the newest target so cursor motion remains smooth while still staying responsive.
+            send_position = (
+                int(last_x + (target_x - last_x) * 0.55),
+                int(last_y + (target_y - last_y) * 0.55),
+            )
+
+        self._last_mouse_send_position = send_position
+        self._mouse_move_target = None
+        self._pending_mouse_move = None
+        self.action_triggered.emit("mouse_move", {"x": send_position[0], "y": send_position[1]})
+
     def mousePressEvent(self, event: QMouseEvent):
+        # Clicks bypass the mouse-move throttle and go out immediately to preserve precise interaction.
+        self._mouse_move_timer.stop()
+        self._flush_pending_mouse_move()
+
         button = "left"
         if event.button() == Qt.RightButton:
             button = "right"
@@ -178,10 +305,11 @@ class RemoteSessionWindow(QMainWindow):
     """The live desktop screen streaming controller containing FPS/quality sliders,
     the scaling video frame layer, and a connection status bar."""
     
-    def __init__(self, ws_url: str, device_id: str):
+    def __init__(self, ws_url: str, device_id: str, auth_token: Optional[str] = None):
         super().__init__()
         self.ws_url = ws_url
         self.device_id = device_id
+        self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
         
         self.setWindowTitle(f"FluxRemote: Controlling {device_id}")
         self.resize(1100, 700)
@@ -231,13 +359,16 @@ class RemoteSessionWindow(QMainWindow):
         self.setStatusBar(self.statusbar)
         self.statusbar.showMessage("Ready.")
         
-        # Create networking thread
-        self.net_thread = WSClientThread(self.ws_url, self.device_id)
+        # Create networking threads
+        self.net_thread = WSClientThread(self.ws_url, self.device_id, self.auth_token)
         self.net_thread.frame_received.connect(self.draw_frame)
         self.net_thread.status_updated.connect(self.statusbar.showMessage)
         self.net_thread.connection_lost.connect(self.on_connection_lost)
-        
         self.net_thread.start()
+
+        self.control_thread = ControlWSClientThread(self.ws_url, self.device_id, self.auth_token)
+        self.control_thread.status_updated.connect(self.statusbar.showMessage)
+        self.control_thread.start()
         
         # Clipboard sync monitor
         self.last_clipboard = ""
@@ -268,7 +399,7 @@ class RemoteSessionWindow(QMainWindow):
             logger.error(f"Error drawing received frame: {e}")
 
     def send_user_action(self, msg_type: str, payload: dict):
-        self.net_thread.send_action(msg_type, payload)
+        self.control_thread.send_action(msg_type, payload)
 
     def on_fps_changed(self, value: int):
         self.lbl_fps.setText(f"Target FPS ({value}):")
@@ -322,6 +453,7 @@ class RemoteSessionWindow(QMainWindow):
             time.sleep(2)
 
     def closeEvent(self, event):
+        self.control_thread.stop()
         self.net_thread.stop()
         event.accept()
 

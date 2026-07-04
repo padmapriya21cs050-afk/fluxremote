@@ -29,7 +29,7 @@ A modern, secure remote access client built with React and Vite that communicate
    cp .env.example .env.local
    
    # Edit .env.local and set VITE_API_URL to your backend
-   # Default: http://localhost:8000
+   # Default: https://fluxremote-mbyy.onrender.com
    ```
 
 ## Development
@@ -57,7 +57,9 @@ npm run preview
 
 ### Environment Variables
 
-- `VITE_API_URL` - Backend API URL (default: `http://localhost:8000`)
+- `VITE_API_URL` - Backend API URL (default: `https://fluxremote-mbyy.onrender.com`)
+- `GEMINI_API_KEY` - Gemini API key for the backend AI assistant. Set this in `fluxremote/backend/.env`, or in a root `.env` file if you want to keep all local config together.
+- `GEMINI_API_URL` - Optional Gemini endpoint override. Defaults to `https://gemini.googleapis.com/v1/models/gemini-1.5-lite:generate`.
 
 ## Project Structure
 

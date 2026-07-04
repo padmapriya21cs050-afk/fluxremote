@@ -1,20 +1,65 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Monitor,
   Settings,
   LogOut,
-  Lock,
   Wifi,
-  WifiOff,
-  Send,
-  Copy,
-  Check,
   Loader,
   AlertCircle,
-  ChevronRight,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  BarChart3,
+  Activity,
+  Brain,
+  X,
 } from "lucide-react";
+import AIAssistant from "./AIAssistant";
+import SessionDashboard from "./SessionDashboard";
+import TunnelSettings from "./TunnelSettings";
+import { getApiBase, normalizeServerUrl } from "../utils/api";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+const buildWebSocketUrl = (serverUrl: string, path: string, token?: string) => {
+  const normalized = normalizeServerUrl(serverUrl);
+  try {
+    const parsed = new URL(normalized);
+    let protocol = parsed.protocol;
+    if (protocol === "https:") protocol = "wss:";
+    if (protocol === "http:") protocol = "ws:";
+    if (protocol !== "ws:" && protocol !== "wss:") protocol = "wss:";
+    const url = `${protocol}//${parsed.host}${path}`;
+    if (!token) {
+      return url;
+    }
+
+    const params = new URLSearchParams();
+    params.set("token", token);
+    params.set("auth_token", token);
+    return `${url}${url.includes("?") ? "&" : "?"}${params.toString()}`;
+  } catch {
+    const cleaned = normalized.replace(/\/+$/, "");
+    const prefix = cleaned.startsWith("http") ? cleaned : `https://${cleaned}`;
+    const parsed = new URL(prefix);
+    const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${protocol}//${parsed.host}${path}`;
+    if (!token) {
+      return url;
+    }
+
+    const params = new URLSearchParams();
+    params.set("token", token);
+    params.set("auth_token", token);
+    return `${url}${url.includes("?") ? "&" : "?"}${params.toString()}`;
+  }
+};
+
+const generateId = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+};
 
 interface Device {
   id: string;
@@ -25,13 +70,25 @@ interface Device {
 interface ConnectionStatus {
   connected: boolean;
   device?: string;
-  latency?: number;
+}
+
+interface DashboardMetrics {
+  ping: number;
+  fps: number;
+  bandwidth: number;
+  hostCpu: number;
+  hostMemory: number;
+  sessionDuration: number;
+}
+
+interface PendingInput {
+  packet: Record<string, any>;
+  attempts: number;
+  lastSent: number;
 }
 
 export default function RemoteClient() {
-  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings">(
-    "devices"
-  );
+  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings" | "assistant">("devices");
 
   // Devices state
   const [devices, setDevices] = useState<Device[]>([]);
@@ -40,60 +97,97 @@ export default function RemoteClient() {
   // Connection state
   const [selectedDevice, setSelectedDevice] = useState<Device | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
-    connected: false,
-  });
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({ connected: false });
   const [connectionError, setConnectionError] = useState("");
+  const [websocketState, setWebsocketState] = useState("disconnected");
+  const [hostStatus, setHostStatus] = useState("offline");
+  const [viewerStatus, setViewerStatus] = useState("disconnected");
 
   // Remote viewer state
   const videoRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-
-  // Cursor position for viewer
-  const [cursorPos, setCursorPos] = useState({ x: 0, y: 0 });
+  const controlWsRef = useRef<WebSocket | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [fitMode, setFitMode] = useState(true);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const [remoteResolution, setRemoteResolution] = useState({ width: 1920, height: 1080 });
 
   // Settings state
-  const [apiUrl, setApiUrl] = useState(API_BASE_URL);
+  const [tunnelEnabled, setTunnelEnabled] = useState(false);
+  const [tunnelUrl, setTunnelUrl] = useState("");
+  const [tunnelToken, setTunnelToken] = useState("");
+  const [tunnelProvider, setTunnelProvider] = useState<"Cloudflare" | "Ngrok" | "Tailscale">("Cloudflare");
   const [settingsSaved, setSettingsSaved] = useState(false);
 
-  const getWebSocketUrl = (apiBase: string, deviceId: string): string => {
-    try {
-      const url = new URL(apiBase);
-      const protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      return `${protocol}//${url.host}/ws/viewer/${encodeURIComponent(deviceId)}`;
-    } catch {
-      const normalized = apiBase.replace(/\/+$/, "").replace(/^https?:\/\//, "");
-      const protocol = apiBase.startsWith("https:") ? "wss:" : "ws:";
-      return `${protocol}//${normalized}/ws/viewer/${encodeURIComponent(deviceId)}`;
+  // Dashboard state
+  const [showDashboard, setShowDashboard] = useState(true);
+  const [dashboardMetrics, setDashboardMetrics] = useState<DashboardMetrics>({
+    ping: 0,
+    fps: 0,
+    bandwidth: 0,
+    hostCpu: 0,
+    hostMemory: 0,
+    sessionDuration: 0,
+  });
+  const sessionStartTimeRef = useRef<number>(0);
+  const lastFpsTimeRef = useRef(Date.now());
+  const frameCountRef = useRef(0);
+  const lastPingSentRef = useRef<number>(0);
+  const remoteResolutionRef = useRef({ width: 1920, height: 1080 });
+
+  // Input reliability state
+  const pendingInputsRef = useRef<Map<string, PendingInput>>(new Map());
+  const inputQueueRef = useRef<Record<string, any>[]>([]);
+  const inputRetryIntervalRef = useRef<number | null>(null);
+  const heartbeatIntervalRef = useRef<number | null>(null);
+
+  const activeServerUrl = useMemo(() => {
+    if (tunnelEnabled && tunnelUrl.trim()) {
+      return normalizeServerUrl(tunnelUrl);
+    }
+    return getApiBase();
+  }, [tunnelEnabled, tunnelUrl]);
+
+  const activeAuthHeaders = useMemo(() => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (tunnelEnabled && tunnelToken.trim()) {
+      headers["Authorization"] = `Bearer ${tunnelToken.trim()}`;
+    }
+    return headers;
+  }, [tunnelEnabled, tunnelToken]);
+
+  const getWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/viewer/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
+  const getControlWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/control/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
+  const getHostWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/host/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
+
+  const persistSettings = () => {
+    localStorage.setItem("tunnelEnabled", JSON.stringify(tunnelEnabled));
+    localStorage.setItem("tunnelUrl", tunnelUrl);
+    localStorage.setItem("tunnelToken", tunnelToken);
+    localStorage.setItem("tunnelProvider", tunnelProvider);
+    setSettingsSaved(true);
+    setTimeout(() => setSettingsSaved(false), 3000);
+  };
+
+  const loadSettings = () => {
+    const enabled = localStorage.getItem("tunnelEnabled");
+    const url = localStorage.getItem("tunnelUrl");
+    const token = localStorage.getItem("tunnelToken");
+    const provider = localStorage.getItem("tunnelProvider");
+
+    setTunnelEnabled(enabled === "true");
+    if (url) setTunnelUrl(url);
+    if (token) setTunnelToken(token);
+    if (provider === "Ngrok" || provider === "Tailscale" || provider === "Cloudflare") {
+      setTunnelProvider(provider);
     }
   };
 
-  const getHostWebSocketUrl = (apiBase: string, deviceId: string): string => {
-    try {
-      const url = new URL(apiBase);
-      const protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      return `${protocol}//${url.host}/ws/host/${encodeURIComponent(deviceId)}`;
-    } catch {
-      const normalized = apiBase.replace(/\/+$/, "").replace(/^https?:\/\//, "");
-      const protocol = apiBase.startsWith("https:") ? "wss:" : "ws:";
-      return `${protocol}//${normalized}/ws/host/${encodeURIComponent(deviceId)}`;
-    }
-  };
-
-  // Clipboard states
-  const [localClipboard, setLocalClipboard] = useState("");
-  const [showCopyFeedback, setShowCopyFeedback] = useState(false);
-  const hostWsRef = useRef<WebSocket | null>(null);
-  const [hostRegistered, setHostRegistered] = useState(false);
-
-  // Fetch available devices
   const fetchDevices = async () => {
     setLoadingDevices(true);
     try {
-      const response = await fetch(`${apiUrl}/api/devices/online`);
-
+      const response = await fetch(`${getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}/api/devices/online`, { headers: activeAuthHeaders });
       if (!response.ok) throw new Error("Failed to fetch devices");
-
       const payload = await response.json();
       const deviceList = Array.isArray(payload) ? payload : payload.devices || [];
       setDevices(
@@ -110,29 +204,262 @@ export default function RemoteClient() {
     }
   };
 
-  // Connect to device
+  const requestAiExplanation = async (issueType: string, context: string) => {
+    setIsConnecting(false);
+    setConnectionError("");
+    setWebsocketState("fetching_ai");
+    try {
+      const response = await fetch(`${getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}/api/ai/explain`, {
+        method: "POST",
+        headers: activeAuthHeaders,
+        body: JSON.stringify({
+          type: issueType,
+          context,
+          metrics: {
+            connection_status: connectionStatus.connected ? "connected" : "disconnected",
+            latency_ms: dashboardMetrics.ping,
+            fps: dashboardMetrics.fps,
+            websocket_state: websocketState,
+            host_resolution: `${remoteResolution.width}x${remoteResolution.height}`,
+            viewer_resolution: `${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`AI service error: ${body}`);
+      }
+
+      const data = await response.json();
+      return data.answer || data.explanation || "No explanation returned.";
+    } catch (err) {
+      console.error("AI explanation error:", err);
+      return "Failed to fetch AI explanation. Check your server and Gemini API key.";
+    } finally {
+      setWebsocketState(connectionStatus.connected ? "connected" : "disconnected");
+    }
+  };
+
+  const updateSessionDuration = () => {
+    const now = Date.now();
+    setDashboardMetrics((prev) => ({
+      ...prev,
+      sessionDuration: Math.floor((now - sessionStartTimeRef.current) / 1000),
+    }));
+  };
+
+  const startHeartbeatAndRetries = () => {
+    if (heartbeatIntervalRef.current) {
+      window.clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+
+    heartbeatIntervalRef.current = window.setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send("heartbeat");
+      }
+      if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+        controlWsRef.current.send("heartbeat");
+        sendControlPacket("ping_check", {});
+      }
+
+      const now = Date.now();
+      pendingInputsRef.current.forEach((pending, messageId) => {
+        if (now - pending.lastSent > 1200 && pending.attempts < 5) {
+          try {
+            controlWsRef.current?.send(JSON.stringify(pending.packet));
+            pendingInputsRef.current.set(messageId, {
+              ...pending,
+              attempts: pending.attempts + 1,
+              lastSent: now,
+            });
+          } catch (err) {
+            console.warn("Retrying control packet failed:", err);
+          }
+        }
+      });
+    }, 1000);
+  };
+
+  const stopHeartbeatAndRetries = () => {
+    if (heartbeatIntervalRef.current) {
+      window.clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+  };
+
+  const queueControlInput = (packet: Record<string, any>) => {
+    inputQueueRef.current.push(packet);
+    if (inputQueueRef.current.length > 200) {
+      inputQueueRef.current.shift();
+    }
+  };
+
+  const flushQueuedInputs = () => {
+    while (inputQueueRef.current.length > 0 && controlWsRef.current?.readyState === WebSocket.OPEN) {
+      const packet = inputQueueRef.current.shift();
+      if (packet) {
+        try {
+          controlWsRef.current.send(JSON.stringify(packet));
+          pendingInputsRef.current.set(packet.message_id, {
+            packet,
+            attempts: 1,
+            lastSent: Date.now(),
+          });
+        } catch (err) {
+          queueControlInput(packet);
+          break;
+        }
+      }
+    }
+  };
+
+  const sendControlPacket = (type: string, payload: Record<string, any>) => {
+    const message_id = generateId();
+    const packet = {
+      type,
+      payload,
+      message_id,
+      timestamp: Date.now(),
+    };
+
+    if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        controlWsRef.current.send(JSON.stringify(packet));
+        pendingInputsRef.current.set(message_id, {
+          packet,
+          attempts: 1,
+          lastSent: Date.now(),
+        });
+      } catch (err) {
+        queueControlInput(packet);
+      }
+    } else {
+      queueControlInput(packet);
+    }
+  };
+
+  const acknowledgeControlPacket = (messageId: string) => {
+    pendingInputsRef.current.delete(messageId);
+  };
+
+  const connectControlSocket = (deviceId: string) => {
+    if (!deviceId) return;
+    if (controlWsRef.current && controlWsRef.current.readyState === WebSocket.OPEN) return;
+
+    const url = getControlWebSocketUrl(deviceId);
+    const controlSocket = new WebSocket(url);
+    controlSocket.onopen = () => {
+      setWebsocketState("control_ready");
+      setViewerStatus("connected");
+      flushQueuedInputs();
+    };
+
+    controlSocket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "control_ack" && data.payload?.message_id) {
+          acknowledgeControlPacket(data.payload.message_id);
+          if (data.payload.status === "sent") {
+            const now = Date.now();
+            setDashboardMetrics((prev) => ({ ...prev, ping: Math.round(now - (lastPingSentRef.current || now)) }));
+          }
+        }
+      } catch (err) {
+        console.warn("Unknown control message:", err);
+      }
+    };
+
+    controlSocket.onerror = () => {
+      setWebsocketState("control_error");
+      setViewerStatus("reconnecting");
+    };
+
+    controlSocket.onclose = () => {
+      setViewerStatus("disconnected");
+      setTimeout(() => connectControlSocket(deviceId), 2000);
+    };
+
+    controlWsRef.current = controlSocket;
+  };
+
+  const resetZoom = () => {
+    setZoom(1);
+    setFitMode(false);
+  };
+
+  const handleZoomIn = () => {
+    setFitMode(false);
+    setZoom((prev) => Math.min(prev + 0.25, 3));
+  };
+
+  const handleZoomOut = () => {
+    setFitMode(false);
+    setZoom((prev) => Math.max(prev - 0.25, 0.5));
+  };
+
+  const handleFitScreen = () => {
+    if (!videoRef.current || !canvasContainerRef.current) return;
+
+    const containerWidth = canvasContainerRef.current.clientWidth;
+    const containerHeight = canvasContainerRef.current.clientHeight;
+    const { width, height } = videoRef.current;
+    const fitZoom = Math.min(containerWidth / width, containerHeight / height, 1);
+
+    setZoom(fitZoom || 1);
+    setFitMode(true);
+  };
+
+  const handleToggleFullscreen = async () => {
+    if (!canvasContainerRef.current) return;
+
+    if (!document.fullscreenElement) {
+      try {
+        await canvasContainerRef.current.requestFullscreen();
+      } catch (err) {
+        console.error("Fullscreen request failed:", err);
+      }
+    } else {
+      await document.exitFullscreen();
+    }
+  };
+
+  const closeRemoteSession = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (controlWsRef.current) {
+      controlWsRef.current.close();
+      controlWsRef.current = null;
+    }
+    stopHeartbeatAndRetries();
+    setConnectionStatus({ connected: false });
+    setSelectedDevice(null);
+    setWebsocketState("disconnected");
+    setHostStatus("offline");
+    setViewerStatus("disconnected");
+    setZoom(1);
+    setFitMode(true);
+  };
+
   const handleConnect = async (device: Device) => {
     setSelectedDevice(device);
     setIsConnecting(true);
     setConnectionError("");
+    sessionStartTimeRef.current = Date.now();
 
     try {
-      const accessPassword = window.prompt(
-        "Enter the access password for this device:"
-      );
+      const accessPassword = window.prompt("Enter the access password for this device:");
       if (!accessPassword) {
         throw new Error("Connection canceled: access password is required.");
       }
 
-      const response = await fetch(`${apiUrl}/api/sessions/create`, {
+      const response = await fetch(`${getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}/api/sessions/create`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          device_id: device.id,
-          access_password: accessPassword,
-        }),
+        headers: activeAuthHeaders,
+        body: JSON.stringify({ device_id: device.id, access_password: accessPassword }),
       });
 
       if (!response.ok) {
@@ -140,186 +467,245 @@ export default function RemoteClient() {
         throw new Error(errorData?.detail || "Connection failed");
       }
 
-      const data = await response.json();
-      const wsUrl = getWebSocketUrl(apiUrl, device.id);
+      const wsUrl = getWebSocketUrl(device.id);
+      const socket = new WebSocket(wsUrl);
+      socket.binaryType = "arraybuffer";
+      wsRef.current = socket;
 
-      wsRef.current = new WebSocket(wsUrl);
-
-      wsRef.current.onopen = () => {
+      socket.onopen = () => {
         setIsConnecting(false);
         setConnectionStatus({ connected: true, device: device.name });
         setActiveTab("remote");
+        setWebsocketState("connected");
+        setHostStatus("online");
+        setViewerStatus("connected");
+        sessionStartTimeRef.current = Date.now();
+        startHeartbeatAndRetries();
+        connectControlSocket(device.id);
       };
 
-      wsRef.current.onmessage = (event) => {
-        // Handle incoming stream frames or data
-        if (videoRef.current && event.data instanceof Blob) {
-          const ctx = videoRef.current.getContext("2d");
-          if (ctx) {
-            const img = new Image();
-            img.onload = () => {
-              ctx.drawImage(img, 0, 0);
-            };
-            img.src = URL.createObjectURL(event.data);
+      socket.onmessage = async (event) => {
+        if (!videoRef.current) return;
+        const ctx = videoRef.current.getContext("2d");
+        if (!ctx) return;
+
+        if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+          try {
+            const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
+            const bitmap = await createImageBitmap(blob);
+            remoteResolutionRef.current = { width: bitmap.width, height: bitmap.height };
+            setRemoteResolution({ width: bitmap.width, height: bitmap.height });
+            videoRef.current.width = bitmap.width;
+            videoRef.current.height = bitmap.height;
+            ctx.clearRect(0, 0, bitmap.width, bitmap.height);
+            ctx.drawImage(bitmap, 0, 0);
+            bitmap.close();
+
+            frameCountRef.current += 1;
+            const now = Date.now();
+            if (now - lastFpsTimeRef.current >= 1000) {
+              setDashboardMetrics((prev) => ({
+                ...prev,
+                fps: frameCountRef.current,
+                sessionDuration: Math.floor((now - sessionStartTimeRef.current) / 1000),
+              }));
+              frameCountRef.current = 0;
+              lastFpsTimeRef.current = now;
+            }
+          } catch (err) {
+            console.error("Failed to decode image frame:", err);
+          }
+        } else {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload?.type === "host_stats") {
+              const values = payload.payload || {};
+              setDashboardMetrics((prev) => ({
+                ...prev,
+                fps: values.fps ?? prev.fps,
+                bandwidth: values.bandwidth_bps ? Math.round(values.bandwidth_bps / 1024) : prev.bandwidth,
+                hostCpu: values.cpu_percent ?? prev.hostCpu,
+                hostMemory: values.memory_percent ?? prev.hostMemory,
+              }));
+              setHostStatus("online");
+            } else if (payload?.type === "control_ack") {
+              if (payload.payload?.message_id) {
+                acknowledgeControlPacket(payload.payload.message_id);
+              }
+            } else if (payload?.type === "error") {
+              setConnectionError(payload.message || "Remote stream error");
+            }
+          } catch (err) {
+            console.warn("Received non-JSON viewer payload", err);
           }
         }
       };
 
-      wsRef.current.onerror = () => {
+      socket.onerror = () => {
         setConnectionError("WebSocket connection error");
+        setWebsocketState("error");
       };
 
-      wsRef.current.onclose = () => {
-        setConnectionStatus({ connected: false });
-        setSelectedDevice(null);
+      socket.onclose = () => {
+        closeRemoteSession();
       };
     } catch (err) {
-      setConnectionError(
-        err instanceof Error ? err.message : "Connection failed"
-      );
+      const errorMsg = err instanceof Error ? err.message : "Connection failed";
+      setConnectionError(errorMsg);
       setIsConnecting(false);
     }
   };
 
-  // Disconnect from device
   const handleDisconnect = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setConnectionStatus({ connected: false });
-    setSelectedDevice(null);
+    closeRemoteSession();
     setActiveTab("devices");
   };
 
-  // Send remote input via WebSocket
-  const handleRemoteInput = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-    const rect = event.currentTarget.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-
-    wsRef.current.send(
-      JSON.stringify({
-        type: "input",
-        action: "click",
-        x: Math.round((x / rect.width) * 1920),
-        y: Math.round((y / rect.height) * 1080),
-      })
-    );
+  const sendRemoteInput = (msg: Record<string, unknown>) => {
+    if (!selectedDevice) return;
+    sendControlPacket(msg.type as string, msg.payload as Record<string, any>);
   };
 
-  // Handle mouse move tracking
-  const handleMouseMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleMouseDown = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!selectedDevice) return;
+    event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
-    setCursorPos({
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
+    const x = (event.clientX - rect.left) / zoom;
+    const y = (event.clientY - rect.top) / zoom;
+    const mappedX = Math.round((x / remoteResolution.width) * remoteResolution.width);
+    const mappedY = Math.round((y / remoteResolution.height) * remoteResolution.height);
+
+    let button = "left";
+    if (event.button === 2) button = "right";
+    if (event.button === 1) button = "middle";
+
+    sendControlPacket("mouse_click", {
+      button,
+      x: Math.max(0, Math.min(remoteResolution.width, mappedX)),
+      y: Math.max(0, Math.min(remoteResolution.height, mappedY)),
     });
   };
 
-  // Save settings
-  const handleSaveSettings = () => {
-    localStorage.setItem("apiUrl", apiUrl);
-    setSettingsSaved(true);
-    setTimeout(() => setSettingsSaved(false), 3000);
+  const moveThrottleRef = useRef<number>(0);
+  const handleMouseMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!selectedDevice) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / zoom;
+    const y = (event.clientY - rect.top) / zoom;
+
+    const now = performance.now();
+    if (now - moveThrottleRef.current < 40) return;
+    moveThrottleRef.current = now;
+
+    const mappedX = Math.round((x / remoteResolution.width) * remoteResolution.width);
+    const mappedY = Math.round((y / remoteResolution.height) * remoteResolution.height);
+    sendControlPacket("mouse_move", {
+      x: Math.max(0, Math.min(remoteResolution.width, mappedX)),
+      y: Math.max(0, Math.min(remoteResolution.height, mappedY)),
+    });
   };
 
-  // Copy to clipboard
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setShowCopyFeedback(true);
-    setTimeout(() => setShowCopyFeedback(false), 2000);
+  const handleCanvasContextMenu = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    event.preventDefault();
   };
 
-  // Handle logout
-  const handleLogout = () => {
-    setDevices([]);
-    handleDisconnect();
-  };
-
-  // Load initial settings
-  useEffect(() => {
-    const savedApiUrl = localStorage.getItem("apiUrl");
-    if (savedApiUrl) {
-      setApiUrl(savedApiUrl);
+  const handleWheel = (event: React.WheelEvent<HTMLCanvasElement>) => {
+    if (event.ctrlKey) {
+      event.preventDefault();
+      if (event.deltaY < 0) {
+        handleZoomIn();
+      } else {
+        handleZoomOut();
+      }
+    } else if (!selectedDevice) {
+      return;
+    } else {
+      event.preventDefault();
+      sendControlPacket("mouse_scroll", {
+        amount: event.deltaY > 0 ? -120 : 120,
+      });
     }
+  };
+
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (!selectedDevice || !connectionStatus.connected) return;
+    const key = event.key;
+    if (key.length === 1 || key === "Enter" || key === "Escape" || key === "Backspace" || key === "Tab") {
+      event.preventDefault();
+      sendControlPacket("key_press", { key });
+    }
+  };
+
+  useEffect(() => {
+    loadSettings();
+    fetchDevices();
   }, []);
 
-  const hostRegistrationStarted = useRef(false);
+  useEffect(() => {
+    if (fitMode) {
+      handleFitScreen();
+    }
+  }, [remoteResolution, fitMode]);
 
   useEffect(() => {
-    if (hostRegistrationStarted.current) {
-      return;
+    if (!canvasContainerRef.current) return;
+    const observer = new ResizeObserver(() => {
+      if (fitMode) handleFitScreen();
+    });
+    observer.observe(canvasContainerRef.current);
+    return () => observer.disconnect();
+  }, [fitMode, remoteResolution]);
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedDevice, connectionStatus.connected]);
+
+  useEffect(() => {
+    if (!wsRef.current && selectedDevice && connectionStatus.connected) {
+      connectControlSocket(selectedDevice.id);
     }
-    hostRegistrationStarted.current = true;
+  }, [selectedDevice, connectionStatus.connected]);
 
-    // Auto-register a host device (for development) and refresh device list
-    const registerHost = async () => {
-      try {
-        // Persist device id
-        let deviceId = localStorage.getItem("hostDeviceId");
-        if (!deviceId) {
-          deviceId = (crypto && (crypto as any).randomUUID ? (crypto as any).randomUUID() : `dev-${Date.now()}-${Math.random().toString(36).slice(2,8)}`);
-          localStorage.setItem("hostDeviceId", deviceId);
-        }
-
-        let deviceName = localStorage.getItem("hostDeviceName");
-        if (!deviceName) {
-          deviceName = (navigator as any).userAgentData?.platform || navigator.platform || "My Computer";
-          localStorage.setItem("hostDeviceName", deviceName);
-        }
-
-        const payload = {
-          device_id: deviceId,
-          device_name: deviceName,
-          access_password: "123456",
-        };
-
-        // Register device with backend
-        const registerResp = await fetch(`${apiUrl}/api/devices/register`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        if (!registerResp.ok) {
-          console.warn("Host registration failed", await registerResp.text().catch(()=>null));
-        } else {
-          setHostRegistered(true);
-          // Open host WebSocket to mark device online
-          try {
-            const wsUrl = getHostWebSocketUrl(apiUrl, deviceId);
-            hostWsRef.current = new WebSocket(wsUrl);
-            hostWsRef.current.onopen = () => {
-              console.info("Host websocket connected:", wsUrl);
-            };
-            hostWsRef.current.onclose = () => {
-              console.info("Host websocket closed");
-            };
-            hostWsRef.current.onerror = (e) => console.error("Host websocket error", e);
-          } catch (e) {
-            console.error("Failed to open host websocket", e);
-          }
-        }
-
-        // Refresh devices list after registration
-        await fetchDevices();
-      } catch (e) {
-        console.error("Auto host registration failed:", e);
-      }
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+      if (controlWsRef.current) controlWsRef.current.close();
+      stopHeartbeatAndRetries();
     };
+  }, []);
 
-    registerHost();
-  }, [apiUrl]);
+  const copyToClipboard = async (text: string) => {
+    await navigator.clipboard.writeText(text);
+  };
 
-  // MAIN APPLICATION INTERFACE
+  const handleLogout = () => {
+    setDevices([]);
+    closeRemoteSession();
+  };
+
+  const sessionMetrics = {
+    connection: connectionStatus.connected ? "Connected" : "Disconnected",
+    ping: dashboardMetrics.ping,
+    fps: dashboardMetrics.fps,
+    bandwidth: dashboardMetrics.bandwidth,
+    cpu: dashboardMetrics.hostCpu,
+    memory: dashboardMetrics.hostMemory,
+    resolution: `${remoteResolution.width}x${remoteResolution.height}`,
+    hostStatus,
+    viewerStatus,
+  };
+
+  const handleReconnect = () => {
+    if (selectedDevice) {
+      handleDisconnect();
+      handleConnect(selectedDevice);
+    }
+  };
+
   return (
     <div className="flex h-screen w-screen bg-[#0B132B] text-slate-100 overflow-hidden">
-      {/* Sidebar */}
       <div className="w-56 bg-[#1E293B] border-r border-slate-800 flex flex-col shrink-0">
-        {/* Header */}
         <div className="p-4 flex items-center gap-3 border-b border-slate-800">
           <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
             <Monitor className="w-4 h-4 text-white" />
@@ -330,7 +716,6 @@ export default function RemoteClient() {
           </div>
         </div>
 
-        {/* Navigation */}
         <nav className="flex-1 p-3 space-y-1">
           <button
             onClick={() => setActiveTab("devices")}
@@ -343,7 +728,6 @@ export default function RemoteClient() {
             <Monitor className="w-4 h-4" />
             Devices
           </button>
-
           <button
             onClick={() => setActiveTab("remote")}
             disabled={!connectionStatus.connected}
@@ -358,7 +742,17 @@ export default function RemoteClient() {
             <Wifi className="w-4 h-4" />
             Remote
           </button>
-
+          <button
+            onClick={() => setActiveTab("assistant")}
+            className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
+              activeTab === "assistant"
+                ? "bg-blue-600 text-white"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
+            }`}
+          >
+            <Brain className="w-4 h-4" />
+            AI Assistant
+          </button>
           <button
             onClick={() => setActiveTab("settings")}
             className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
@@ -372,13 +766,14 @@ export default function RemoteClient() {
           </button>
         </nav>
 
-        {/* Status & Logout */}
         <div className="p-4 border-t border-slate-800 space-y-3">
           <div className="text-[10px]">
             <div className="flex items-center gap-2 text-slate-400 mb-1">
-              <span className={`w-2 h-2 rounded-full ${
-                connectionStatus.connected ? "bg-emerald-500" : "bg-slate-500"
-              }`} />
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  connectionStatus.connected ? "bg-emerald-500 animate-pulse" : "bg-slate-500"
+                }`}
+              />
               <span>
                 {connectionStatus.connected
                   ? `Connected: ${connectionStatus.device}`
@@ -397,25 +792,18 @@ export default function RemoteClient() {
         </div>
       </div>
 
-      {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top Status Bar */}
-        <div className="h-12 border-b border-slate-800 bg-[#0F172A] flex items-center px-6 shrink-0">
-          <div className="flex items-center gap-2 text-xs font-mono">
-            <div
-              className={`w-2 h-2 rounded-full ${
-                connectionStatus.connected ? "bg-emerald-500 animate-pulse" : "bg-slate-600"
-              }`}
-            />
+        <div className="h-12 border-b border-slate-800 bg-[#0F172A] flex items-center px-6 shrink-0 justify-between">
+          <div className="flex items-center gap-4 text-xs font-mono">
+            <div className={`w-2 h-2 rounded-full ${connectionStatus.connected ? "bg-emerald-500 animate-pulse" : "bg-slate-600"}`} />
             {connectionStatus.connected ? (
               <>
                 <span className="text-slate-400">
-                  Connected to:{" "}
-                  <b className="text-white">{connectionStatus.device}</b>
+                  Connected to: <b className="text-white">{connectionStatus.device}</b>
                 </span>
-                {connectionStatus.latency && (
+                {dashboardMetrics.ping > 0 && (
                   <span className="text-slate-400">
-                    Latency: <b className="text-blue-400">{connectionStatus.latency} ms</b>
+                    Ping: <b className="text-blue-400">{dashboardMetrics.ping}ms</b>
                   </span>
                 )}
               </>
@@ -423,18 +811,32 @@ export default function RemoteClient() {
               <span className="text-slate-400">Ready for connection</span>
             )}
           </div>
+          {connectionStatus.connected && activeTab === "remote" && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowDashboard(!showDashboard)}
+                className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
+                title="Toggle Dashboard"
+              >
+                <BarChart3 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setActiveTab("assistant")}
+                className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
+                title="AI Assistant"
+              >
+                <Brain className="w-4 h-4" />
+              </button>
+            </div>
+          )}
         </div>
 
-        {/* Content Area */}
-        <div className="flex-1 overflow-y-auto p-6">
-          {/* DEVICES TAB */}
+        <div className="flex-1 overflow-y-auto p-6 flex gap-6">
           {activeTab === "devices" && (
-            <div className="space-y-6 max-w-5xl">
+            <div className="space-y-6 max-w-5xl w-full">
               <div>
                 <h2 className="text-xl font-bold text-white mb-1">Devices</h2>
-                <p className="text-sm text-slate-400">
-                  Select a device to start a remote session
-                </p>
+                <p className="text-sm text-slate-400">Select a device to start a remote session</p>
               </div>
 
               {loadingDevices ? (
@@ -449,26 +851,14 @@ export default function RemoteClient() {
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {devices.map((device) => (
-                    <div
-                      key={device.id}
-                      className="bg-[#1E293B] border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition"
-                    >
+                    <div key={device.id} className="bg-[#1E293B] border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition">
                       <div className="flex items-start justify-between mb-3">
                         <div>
                           <h3 className="font-semibold text-white">{device.name}</h3>
                           <p className="text-xs text-slate-400 font-mono">{device.id}</p>
                         </div>
-                        <div
-                          className={`w-2 h-2 rounded-full ${
-                            device.status === "online"
-                              ? "bg-emerald-500"
-                              : device.status === "in-session"
-                              ? "bg-blue-500"
-                              : "bg-slate-500"
-                          }`}
-                        />
+                        <div className={`w-2 h-2 rounded-full ${device.status === "online" ? "bg-emerald-500" : device.status === "in-session" ? "bg-blue-500" : "bg-slate-500"}`} />
                       </div>
-
                       <button
                         onClick={() => handleConnect(device)}
                         disabled={device.status === "offline" || isConnecting}
@@ -491,7 +881,6 @@ export default function RemoteClient() {
                 </div>
               )}
 
-              {/* Refresh button */}
               <div className="flex gap-2">
                 <button
                   onClick={fetchDevices}
@@ -503,112 +892,236 @@ export default function RemoteClient() {
             </div>
           )}
 
-          {/* REMOTE TAB */}
           {activeTab === "remote" && (
-            <div className="space-y-4 max-w-5xl">
+            <div className="space-y-4 flex-1 flex flex-col">
               <div className="flex items-center justify-between">
                 <div>
-                  <h2 className="text-xl font-bold text-white">
-                    {selectedDevice?.name}
-                  </h2>
+                  <h2 className="text-xl font-bold text-white">{selectedDevice?.name}</h2>
                   <p className="text-sm text-slate-400">Remote desktop viewer</p>
                 </div>
-                <button
-                  onClick={handleDisconnect}
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-lg transition"
-                >
-                  Disconnect
-                </button>
+                <div className="flex gap-2 flex-wrap">
+                  <button
+                    onClick={handleFitScreen}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition flex items-center gap-1"
+                    title="Fit to screen"
+                  >
+                    <Maximize2 className="w-3 h-3" /> Fit
+                  </button>
+                  <button
+                    onClick={handleZoomIn}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition flex items-center gap-1"
+                    title="Zoom in"
+                  >
+                    <ZoomIn className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={handleZoomOut}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition flex items-center gap-1"
+                    title="Zoom out"
+                  >
+                    <ZoomOut className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={resetZoom}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition"
+                    title="100% scale"
+                  >
+                    100%
+                  </button>
+                  <button
+                    onClick={handleToggleFullscreen}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition flex items-center gap-1"
+                    title="Fullscreen"
+                  >
+                    <Maximize2 className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={handleDisconnect}
+                    className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-lg transition"
+                  >
+                    Disconnect
+                  </button>
+                </div>
               </div>
 
-              {/* Canvas/Video Viewer */}
-              <div className="bg-slate-950 border-2 border-slate-800 rounded-lg overflow-hidden shadow-xl">
-                <canvas
-                  ref={videoRef}
-                  onClick={handleRemoteInput}
-                  onMouseMove={handleMouseMove}
-                  width={1920}
-                  height={1080}
-                  className="w-full cursor-crosshair bg-black"
-                />
+              <div className="flex items-center gap-2 text-xs text-slate-400">
+                <span>Zoom: {Math.round(zoom * 100)}%</span>
+                <span>|</span>
+                <span>Resolution: {remoteResolution.width}x{remoteResolution.height}</span>
+                <span>|</span>
+                <span>Session: {dashboardMetrics.sessionDuration}s</span>
+              </div>
+
+              <div className="flex gap-6 flex-1">
+                <div
+                  ref={canvasContainerRef}
+                  className="bg-slate-950 border-2 border-slate-800 rounded-lg overflow-auto shadow-xl flex-1 flex items-center justify-center"
+                >
+                  <canvas
+                    ref={videoRef}
+                    onMouseDown={handleMouseDown}
+                    onMouseMove={handleMouseMove}
+                    onContextMenu={handleCanvasContextMenu}
+                    onWheel={handleWheel}
+                    width={remoteResolution.width}
+                    height={remoteResolution.height}
+                    className="cursor-crosshair bg-black block"
+                    style={{
+                      width: `${remoteResolution.width * zoom}px`,
+                      height: `${remoteResolution.height * zoom}px`,
+                      maxWidth: "100%",
+                      maxHeight: "100%",
+                    }}
+                  />
+                </div>
+
+                <div className="w-80 space-y-4 overflow-y-auto">
+                  {showDashboard && (
+                    <SessionDashboard
+                      connection={sessionMetrics.connection}
+                      websocketState={websocketState}
+                      hostStatus={sessionMetrics.hostStatus}
+                      viewerStatus={sessionMetrics.viewerStatus}
+                      ping={sessionMetrics.ping}
+                      fps={sessionMetrics.fps}
+                      bandwidth={sessionMetrics.bandwidth}
+                      cpu={sessionMetrics.cpu}
+                      memory={sessionMetrics.memory}
+                      resolution={sessionMetrics.resolution}
+                      onReconnect={handleReconnect}
+                    />
+                  )}
+                </div>
               </div>
 
               {connectionError && (
                 <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
                   <AlertCircle className="w-4 h-4" />
-                  {connectionError}
+                  <div className="flex-1">{connectionError}</div>
+                  <button
+                    onClick={handleReconnect}
+                    className="ml-2 px-3 py-1 bg-rose-600 hover:bg-rose-700 rounded text-xs font-bold transition"
+                  >
+                    Retry
+                  </button>
                 </div>
               )}
             </div>
           )}
 
-          {/* SETTINGS TAB */}
+          {activeTab === "assistant" && (
+            <div className="w-full max-w-4xl">
+              <AIAssistant
+                apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
+                connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
+                latency={dashboardMetrics.ping}
+                fps={dashboardMetrics.fps}
+                websocketState={websocketState}
+                hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
+                viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
+              />
+            </div>
+          )}
+
           {activeTab === "settings" && (
-            <div className="space-y-6 max-w-2xl">
+            <div className="space-y-6 max-w-2xl w-full">
               <div>
                 <h2 className="text-xl font-bold text-white mb-1">Settings</h2>
-                <p className="text-sm text-slate-400">
-                  Configure FluxRemote client settings
-                </p>
+                <p className="text-sm text-slate-400">Configure FluxRemote client settings</p>
               </div>
 
-              {/* API Configuration */}
               <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-6 space-y-4">
                 <div>
-                  <h3 className="text-sm font-semibold text-white mb-3">
-                    API Configuration
-                  </h3>
+                  <h3 className="text-sm font-semibold text-white mb-3">Backend Connectivity</h3>
                   <label className="text-xs font-semibold text-slate-300 block mb-2">
-                    Backend API URL
+                    Tunnel mode
                   </label>
-                  <input
-                    type="text"
-                    value={apiUrl}
-                    onChange={(e) => setApiUrl(e.target.value)}
-                    placeholder="http://localhost:8000"
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2.5 text-white placeholder:text-slate-600 focus:outline-none focus:border-blue-500 transition text-sm"
-                  />
-                  <p className="text-xs text-slate-500 mt-2">
-                    Current: <span className="font-mono">{API_BASE_URL}</span>
-                  </p>
+                  <div className="flex items-center gap-3 mb-3">
+                    <button
+                      onClick={() => setTunnelEnabled(true)}
+                      className={`px-3 py-2 rounded-lg text-xs font-semibold ${tunnelEnabled ? "bg-blue-600 text-white" : "bg-slate-800 text-slate-300"}`}
+                    >
+                      Enabled
+                    </button>
+                    <button
+                      onClick={() => setTunnelEnabled(false)}
+                      className={`px-3 py-2 rounded-lg text-xs font-semibold ${!tunnelEnabled ? "bg-blue-600 text-white" : "bg-slate-800 text-slate-300"}`}
+                    >
+                      Disabled
+                    </button>
+                  </div>
+
+                  <label className="text-xs font-semibold text-slate-300 block mb-2">
+                    Provider
+                  </label>
+                  <select
+                    value={tunnelProvider}
+                    onChange={(event) => setTunnelProvider(event.target.value as any)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                  >
+                    <option>Cloudflare</option>
+                    <option>Ngrok</option>
+                    <option>Tailscale</option>
+                  </select>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-300 block mb-2">
+                      Tunnel URL
+                    </label>
+                    <input
+                      value={tunnelUrl}
+                      onChange={(event) => setTunnelUrl(event.target.value)}
+                      placeholder="https://example.trycloudflare.com"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-slate-300 block mb-2">
+                      Token (optional)
+                    </label>
+                    <input
+                      value={tunnelToken}
+                      onChange={(event) => setTunnelToken(event.target.value)}
+                      placeholder="Tunnel bearer token"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
                 </div>
 
                 <button
-                  onClick={handleSaveSettings}
+                  onClick={persistSettings}
                   className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition"
                 >
-                  {settingsSaved ? "✓ Saved" : "Save Settings"}
+                  {settingsSaved ? "✓ Saved" : "Save Tunnel Settings"}
                 </button>
               </div>
 
-              {/* Device Information */}
-              {selectedDevice && (
-                <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-6 space-y-4">
-                  <h3 className="text-sm font-semibold text-white">
-                    Active Connection
-                  </h3>
-                  <div className="space-y-2 text-sm">
-                    <p>
-                      <span className="text-slate-400">Device:</span>
-                      <span className="text-white ml-2">{selectedDevice.name}</span>
-                    </p>
-                    <p>
-                      <span className="text-slate-400">ID:</span>
-                      <span className="text-slate-300 ml-2 font-mono text-xs">
-                        {selectedDevice.id}
-                      </span>
-                    </p>
+              <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-6 space-y-4">
+                <h3 className="text-sm font-semibold text-white">Current connectivity</h3>
+                <div className="text-xs text-slate-400 space-y-2">
+                  <div>
+                    <span className="font-semibold text-slate-200">Server:</span> {activeServerUrl}
+                  </div>
+                  <div>
+                    <span className="font-semibold text-slate-200">Tunnel mode:</span> {tunnelEnabled ? "Enabled" : "Disabled"}
+                  </div>
+                  <div>
+                    <span className="font-semibold text-slate-200">Provider:</span> {tunnelProvider}
                   </div>
                 </div>
-              )}
+              </div>
 
-              {/* About */}
               <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-6">
                 <h3 className="text-sm font-semibold text-white mb-2">About</h3>
                 <p className="text-xs text-slate-400">
                   FluxRemote v1.0.0
                   <br />
                   Secure remote access client
+                  <br />
+                  Supports tunnel URL routing, input buffering, and AI troubleshooting.
                 </p>
               </div>
             </div>

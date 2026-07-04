@@ -56,12 +56,22 @@ def init_db():
         device_id TEXT NOT NULL,
         viewer_id TEXT NOT NULL,
         host_id TEXT NOT NULL,
+        session_token TEXT UNIQUE,
+        pairing_code TEXT,
         status TEXT DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ended_at TIMESTAMP,
         FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
     );
     """)
+
+    # Ensure session token and pairing code columns exist for older databases
+    cursor.execute("PRAGMA table_info(sessions);")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+    if 'session_token' not in existing_columns:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN session_token TEXT;")
+    if 'pairing_code' not in existing_columns:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN pairing_code TEXT;")
     
     # Connection History table
     cursor.execute("""
@@ -161,13 +171,13 @@ def get_online_devices() -> List[Dict[str, Any]]:
     conn.close()
     return [dict(row) for row in rows]
 
-def create_session(session_id: str, device_id: str, viewer_id: str, host_id: str) -> bool:
+def create_session(session_id: str, device_id: str, viewer_id: str, host_id: str, session_token: str = None, pairing_code: str = None) -> bool:
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO sessions (session_id, device_id, viewer_id, host_id) VALUES (?, ?, ?, ?)",
-            (session_id, device_id, viewer_id, host_id)
+            "INSERT INTO sessions (session_id, device_id, viewer_id, host_id, session_token, pairing_code) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, device_id, viewer_id, host_id, session_token, pairing_code)
         )
         conn.commit()
         conn.close()
@@ -175,6 +185,15 @@ def create_session(session_id: str, device_id: str, viewer_id: str, host_id: str
     except Exception as e:
         logger.error(f"Error creating session record: {e}")
         return False
+
+
+def get_session_by_token(session_token: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM sessions WHERE session_token = ?", (session_token,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 def close_session(session_id: str, duration: int = 0, bytes_tx: int = 0):
     conn = get_connection()

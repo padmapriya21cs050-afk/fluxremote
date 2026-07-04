@@ -25,3 +25,5 @@ class SessionResponse(BaseModel):
     host_id: str
     status: str
     created_at: datetime
+    session_token: Optional[str] = None
+    pairing_code: Optional[str] = None
