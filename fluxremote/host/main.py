@@ -281,7 +281,25 @@ class FluxHost:
         started = time.perf_counter()
         msg_type = None
         try:
-            data = json.loads(message)
+            logger.debug("Control message received: %r", message)
+            if message is None:
+                return
+
+            if isinstance(message, (bytes, bytearray)):
+                message = message.decode("utf-8", errors="replace")
+
+            if isinstance(message, str):
+                if not message.strip():
+                    return
+                if message.strip().lower() in {"ping", "pong"}:
+                    return
+
+            try:
+                data = json.loads(message)
+            except Exception:
+                logger.warning("Ignoring non-JSON control message: %r", message)
+                return
+
             msg_type = data.get("type")
             payload = data.get("payload", {})
             

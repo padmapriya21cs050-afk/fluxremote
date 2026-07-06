@@ -2,10 +2,14 @@
 import logging
 import time
 import os
+import sys
 import json
 import uuid
 import secrets
+import ast
 import asyncio
+import traceback
+from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +17,14 @@ from typing import Any, Dict, Set, Optional, List
 from dotenv import load_dotenv, find_dotenv
 from google import genai
 
-from models import DeviceRegister, SessionCreate, SessionResponse
-import database as db
-import auth
-from tunnel_auth import extract_ws_auth_token, is_ws_request_authorized
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from fluxremote.backend.models import DeviceRegister, SessionCreate, SessionResponse
+from fluxremote.backend import database as db
+from fluxremote.backend import auth
+from fluxremote.backend.tunnel_auth import extract_ws_auth_token, is_ws_request_authorized
 
 # Set up logging first so environment loading can be reported.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -76,7 +84,11 @@ async def _ensure_ws_authorized(websocket: WebSocket) -> bool:
 
     await websocket.accept()
     await websocket.send_text(json.dumps({"type": "error", "message": "Invalid or missing tunnel token."}))
-    await websocket.close(code=1008)
+    logger.info("Closing websocket due to invalid or missing tunnel token (code=1008)")
+    try:
+        await websocket.close(code=1008)
+    except Exception:
+        traceback.print_exc()
     return False
 
 
@@ -239,15 +251,36 @@ def ai_explain_issue(request: Dict[str, Any]):
 
 @app.post("/api/sessions/create", response_model=SessionResponse)
 def create_session(session_req: SessionCreate):
-    device = db.get_device(session_req.device_id)
+    device_id = session_req.device_id
+    supplied_password = session_req.access_password
+    print(f"Session create request device_id={device_id}")
+    logger.info("Session create request device_id=%s", device_id)
+
+    device = db.get_device(device_id)
+    device_exists = device is not None
+    print(f"Device exists in DB: {device_exists}")
+    logger.info("Device exists in DB: %s", device_exists)
+
     if not device:
+        logger.info("403 because device not found for device_id=%s", device_id)
+        print(f"403 because device not found for device_id={device_id}")
         raise HTTPException(status_code=404, detail="Target device not registered.")
 
     if not device["is_online"]:
+        logger.info("403 because device offline for device_id=%s", device_id)
+        print(f"403 because device offline for device_id={device_id}")
         raise HTTPException(status_code=400, detail="Target host desktop is currently offline.")
 
-    if not auth.verify_password(session_req.access_password, device["access_password_hash"]):
+    password_matches = auth.verify_password(supplied_password, device["access_password_hash"])
+    print(f"Password matches: {password_matches}")
+    logger.info("Password matches: %s", password_matches)
+
+    if not password_matches:
+        logger.info("403 because password verification failed for device_id=%s", device_id)
+        print(f"403 because password verification failed for device_id={device_id}")
         raise HTTPException(status_code=403, detail="Invalid access password.")
+
+    logger.info("Session creation accepted for device_id=%s", device_id)
 
     session_id = str(uuid.uuid4())
     viewer_id = str(uuid.uuid4())
@@ -296,6 +329,7 @@ class ConnectionManager:
         self.hosts[device_id] = websocket
         db.update_device_status(device_id, is_online=True)
         logger.info(f"Host desktop {device_id} is now ONLINE.")
+        print("Host connected", device_id)
 
     def unregister_host(self, device_id: str):
         if device_id in self.hosts:
@@ -307,21 +341,31 @@ class ConnectionManager:
         await websocket.accept()
         if device_id not in self.hosts:
             await websocket.send_text(json.dumps({"type": "error", "message": "Host is offline."}))
-            await websocket.close()
+            logger.info("Closing viewer websocket for device %s because host is offline (code=1000)", device_id)
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                traceback.print_exc()
             return False
-            
+
         if device_id not in self.viewers:
             self.viewers[device_id] = set()
         self.viewers[device_id].add(websocket)
         self.viewer_targets[websocket] = device_id
-        logger.info(f"Viewer connected to desktop {device_id}. Total viewers: {len(self.viewers[device_id])}")
-        
+        logger.info("Viewer connected: %s", device_id)
+        print(f"Viewer connected: {device_id}")
+        viewer_keys = sorted(self.viewers.keys())
+        logger.info("Viewer dictionary keys after connection: %s", viewer_keys)
+        print(f"Viewer dictionary keys after connection: {viewer_keys}")
+        logger.info("Viewer connected to desktop %s. Total viewers: %d", device_id, len(self.viewers[device_id]))
+
         # Notify host that a viewer joined
         try:
             await self.hosts[device_id].send_text(json.dumps({"type": "viewer_status", "status": "connected"}))
         except Exception as e:
             logger.error(f"Failed to send viewer notification to host: {e}")
-            
+            traceback.print_exc()
+
         return True
 
     async def unregister_viewer(self, websocket: WebSocket):
@@ -331,6 +375,8 @@ class ConnectionManager:
                 self.viewers[device_id].discard(websocket)
                 if not self.viewers[device_id]:
                     del self.viewers[device_id]
+                    print(f"Viewer dictionary key removed: {device_id}")
+                    logger.info("Viewer dictionary key removed: %s", device_id)
                     # Inform host that all viewers disconnected
                     if device_id in self.hosts:
                         try:
@@ -338,28 +384,36 @@ class ConnectionManager:
                         except Exception:
                             pass
             del self.viewer_targets[websocket]
-            logger.info(f"Viewer disconnected from desktop {device_id}.")
+            logger.info("Viewer disconnected: %s", device_id)
+            print(f"Viewer disconnected: {device_id}")
 
     async def register_host_control(self, device_id: str, websocket: WebSocket):
         await websocket.accept()
         self.host_controls[device_id] = websocket
         logger.info(f"Host control tunnel connected for desktop {device_id}.")
+        print("Control host connected", device_id)
 
     def unregister_host_control(self, device_id: str):
         if device_id in self.host_controls:
             del self.host_controls[device_id]
+        print("Control host disconnected", device_id)
 
     async def register_viewer_control(self, device_id: str, websocket: WebSocket) -> bool:
         await websocket.accept()
-        if device_id not in self.host_controls and device_id not in self.hosts:
+        if device_id not in self.host_controls:
             await websocket.send_text(json.dumps({"type": "error", "message": "Host control tunnel is offline."}))
-            await websocket.close()
+            logger.info("Closing control viewer websocket for device %s because host control tunnel is offline (code=1000)", device_id)
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                traceback.print_exc()
             return False
 
         if device_id not in self.control_viewers:
             self.control_viewers[device_id] = set()
         self.control_viewers[device_id].add(websocket)
         self.control_viewer_targets[websocket] = device_id
+        print("Control viewer connected", device_id)
         return True
 
     async def unregister_viewer_control(self, websocket: WebSocket):
@@ -370,6 +424,7 @@ class ConnectionManager:
                 if not self.control_viewers[device_id]:
                     del self.control_viewers[device_id]
             del self.control_viewer_targets[websocket]
+            print("Control viewer disconnected", device_id)
 
     async def relay_from_host(self, device_id: str, message: Any):
         """Relays screen video frames (binary or text) to all connected viewers."""
@@ -385,25 +440,58 @@ class ConnectionManager:
             for ws in targets:
                 try:
                     if isinstance(message, bytes):
+                        logger.info("Host binary frame received for device %s size=%d bytes", device_id, len(message))
+                        print("FROM HOST:", repr(message))
                         coros.append(ws.send_bytes(message))
+                        logger.info("Forwarding host binary frame to viewer for device %s size=%d bytes", device_id, len(message))
+                        print("FORWARD TO VIEWER:", repr(message))
                     else:
+                        print("FROM HOST:", repr(message))
                         coros.append(ws.send_text(message))
+                        print("FORWARD TO VIEWER:", repr(message))
                 except Exception:
-                    pass
+                    traceback.print_exc()
             if coros:
                 await asyncio.gather(*coros, return_exceptions=True)
+        else:
+            if isinstance(message, (bytes, bytearray)):
+                logger.info("No viewer connected for device %s; dropping host binary frame size=%d bytes", device_id, len(message))
+            else:
+                logger.info("No viewer connected for device %s; dropping host text payload", device_id)
 
-    async def relay_from_viewer(self, websocket: WebSocket, message: str):
+    async def relay_from_viewer(self, websocket: WebSocket, message: Any):
         """Relays interactive controls from a specific viewer to their target host."""
         if websocket in self.viewer_targets:
             device_id = self.viewer_targets[websocket]
             if device_id in self.hosts:
-                try:
-                    # Forward the JSON action parameters direct to host input queue
-                    await self.hosts[device_id].send_text(message)
-                    # Acknowledge reception back to the viewer for retry fallback
+                # Forward the raw message string exactly as received. Do not parse/modify.
+                raw = message
+                if isinstance(message, (bytes, bytearray)):
                     try:
-                        parsed = json.loads(message)
+                        raw = message.decode("utf-8")
+                    except Exception as exc:
+                        logger.debug(f"Relay ignored non-decodable viewer control bytes: {exc}")
+                        return
+
+                if raw is None:
+                    logger.debug("Relay ignored None viewer control payload")
+                    return
+
+                raw_str = str(raw)
+                # Ignore simple heartbeats
+                if raw_str.strip() in ("", "heartbeat", "ping", "pong"):
+                    logger.debug("Relay ignored viewer control payload: %r", raw_str)
+                    return
+
+                print("FROM VIEWER:", repr(raw_str))
+                try:
+                    await self.hosts[device_id].send_text(raw_str)
+                    print("FORWARD TO HOST:", repr(raw_str))
+                    logger.debug("Relay forwarded viewer control to host %s: %r", device_id, raw_str)
+
+                    # Acknowledge if message contains a message_id (best-effort, but do not modify forwarded payload)
+                    try:
+                        parsed = json.loads(raw_str)
                         if isinstance(parsed, dict) and parsed.get("type"):
                             await websocket.send_text(json.dumps({
                                 "type": "control_ack",
@@ -413,20 +501,42 @@ class ConnectionManager:
                         pass
                 except Exception as e:
                     logger.error(f"Error relaying event to host {device_id}: {e}")
+                    traceback.print_exc()
 
-    async def relay_control_from_viewer(self, websocket: WebSocket, message: str):
+    async def relay_control_from_viewer(self, websocket: WebSocket, message: Any):
         """Relays low-latency viewer input over a dedicated control tunnel to the host."""
         if websocket in self.control_viewer_targets:
             device_id = self.control_viewer_targets[websocket]
+            # Expecting an already-extracted raw text message. Forward it verbatim.
+            raw = message
+            if isinstance(message, (bytes, bytearray)):
+                try:
+                    raw = message.decode("utf-8")
+                except Exception as exc:
+                    logger.debug(f"Relay ignored non-decodable viewer control bytes: {exc}")
+                    return
+
+            if raw is None:
+                logger.debug("Relay ignored None control payload")
+                return
+
+            raw_str = str(raw)
+            if raw_str.strip() in ("", "heartbeat", "ping", "pong"):
+                logger.debug("Relay ignored control payload: %r", raw_str)
+                return
+
+            print("FROM VIEWER:", repr(raw_str))
+            logger.debug("Relay received low-latency viewer control for %s: %r", device_id, raw_str)
             try:
                 if device_id in self.host_controls:
-                    await self.host_controls[device_id].send_text(message)
+                    await self.host_controls[device_id].send_text(raw_str)
                 elif device_id in self.hosts:
-                    await self.hosts[device_id].send_text(message)
+                    await self.hosts[device_id].send_text(raw_str)
+                print("FORWARD TO HOST:", repr(raw_str))
+                logger.debug("Relay forwarded low-latency control to host %s: %r", device_id, raw_str)
 
-                # Always acknowledge control packets back to viewer
                 try:
-                    parsed = json.loads(message)
+                    parsed = json.loads(raw_str)
                     if isinstance(parsed, dict) and parsed.get("type"):
                         await websocket.send_text(json.dumps({
                             "type": "control_ack",
@@ -436,6 +546,62 @@ class ConnectionManager:
                     pass
             except Exception as e:
                 logger.error(f"Error relaying control event to host {device_id}: {e}")
+                traceback.print_exc()
+
+def _normalize_ws_payload(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("text"), str):
+            payload = payload["text"]
+        elif isinstance(payload.get("bytes"), (bytes, bytearray)):
+            try:
+                return payload["bytes"].decode("utf-8")
+            except Exception as exc:
+                logger.debug(f"Control payload dict bytes decode failed: {exc}")
+                return None
+        else:
+            return None
+
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = payload.decode("utf-8")
+        except Exception as exc:
+            logger.debug(f"Control payload bytes decode failed: {exc}")
+            return None
+
+    text = str(payload).strip()
+
+    if text.startswith(("b'", 'b"')):
+        try:
+            raw_bytes = ast.literal_eval(text)
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                text = raw_bytes.decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            logger.debug(f"Control payload literal_eval failed: {exc}")
+
+    while (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        inner = text[1:-1].strip()
+        if inner.startswith('{') or inner.startswith('['):
+            text = inner
+            continue
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, str):
+                text = parsed.strip()
+                continue
+            if isinstance(parsed, (dict, list)):
+                text = json.dumps(parsed)
+                break
+        except Exception:
+            break
+
+    if text.startswith("{") and "'" in text and '"' not in text:
+        text = text.replace("'", '"')
+
+    return text
+
 
 connection_manager = ConnectionManager()
 
@@ -451,8 +617,17 @@ async def ws_host_endpoint(websocket: WebSocket, device_id: str):
     
     try:
         while True:
-            data = await websocket.receive()
+            try:
+                data = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                logger.warning(f"Host {device_id} disconnected unexpectedly (receive).")
+                break
+            except Exception:
+                traceback.print_exc()
+                break
+
             if "bytes" in data:
+                logger.info("Host websocket received binary frame from device %s", device_id)
                 await connection_manager.relay_from_host(device_id, data["bytes"])
             elif "text" in data:
                 text_data = data["text"]
@@ -477,30 +652,68 @@ async def ws_host_endpoint(websocket: WebSocket, device_id: str):
 
 @app.websocket("/ws/viewer/{device_id}")
 async def ws_viewer_endpoint(websocket: WebSocket, device_id: str):
+    logger.info("Viewer websocket request received for device %s", device_id)
+    print(f"Viewer websocket request received for device {device_id}")
+
     if not await _ensure_ws_authorized(websocket):
         return
 
     session_token = extract_ws_auth_token(dict(websocket.query_params), dict(websocket.headers.items()) if websocket.headers else None)
+    logger.info("Viewer websocket auth token present for device %s: %s", device_id, bool(session_token))
     if session_token:
         session = db.get_session_by_token(session_token)
         if not session or session["device_id"] != device_id:
             await websocket.accept()
             await websocket.send_text(json.dumps({"type": "error", "message": "Invalid or expired session token."}))
-            await websocket.close()
+            logger.info("Closing viewer websocket for device %s because session token is invalid or expired (code=1000)", device_id)
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                traceback.print_exc()
             return
 
     success = await connection_manager.register_viewer(device_id, websocket)
     if not success:
+        logger.info("Viewer websocket registration failed for device %s", device_id)
         return
 
     try:
         while True:
-            message = await websocket.receive_text()
-            if message == "heartbeat":
+            try:
+                data = await websocket.receive()
+            except WebSocketDisconnect:
+                logger.info("Viewer websocket disconnected for device %s", device_id)
+                break
+            except RuntimeError as exc:
+                logger.exception("Viewer websocket receive runtime error for device %s", device_id)
+                print(f"Viewer websocket receive runtime error for device {device_id}: {exc}")
+                traceback.print_exc()
+                break
+            except Exception as exc:
+                logger.exception("Viewer websocket unexpected exception for device %s", device_id)
+                print(f"Viewer websocket unexpected exception for device {device_id}: {exc}")
+                traceback.print_exc()
+                break
+
+            if "text" in data:
+                raw_message = data["text"]
+            elif "bytes" in data:
+                raw_message = data["bytes"]
+            else:
                 continue
-            await connection_manager.relay_from_viewer(websocket, message)
+
+            normalized = _normalize_ws_payload(raw_message)
+            logger.debug("Viewer control raw receive: %r -> %r", raw_message, normalized)
+            if normalized in (None, "", "heartbeat", "ping", "pong"):
+                logger.debug("Viewer control ignored payload: %r", raw_message)
+                continue
+            await connection_manager.relay_from_viewer(websocket, normalized)
     except WebSocketDisconnect:
-        pass
+        logger.info("Viewer websocket disconnected for device %s", device_id)
+    except Exception as exc:
+        logger.exception("Viewer websocket exception while processing device %s", device_id)
+        print(f"Viewer websocket exception while processing device {device_id}: {exc}")
+        traceback.print_exc()
     finally:
         await connection_manager.unregister_viewer(websocket)
 
@@ -510,16 +723,48 @@ async def ws_control_viewer_endpoint(websocket: WebSocket, device_id: str):
     if not await _ensure_ws_authorized(websocket):
         return
 
+    session_token = extract_ws_auth_token(dict(websocket.query_params), dict(websocket.headers.items()) if websocket.headers else None)
+    if session_token:
+        session = db.get_session_by_token(session_token)
+        if not session or session["device_id"] != device_id:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"type": "error", "message": "Invalid or expired session token."}))
+            logger.info("Closing control viewer websocket for device %s because session token is invalid or expired (code=1000)", device_id)
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                traceback.print_exc()
+            return
+
     success = await connection_manager.register_viewer_control(device_id, websocket)
     if not success:
         return
 
     try:
         while True:
-            message = await websocket.receive_text()
-            if message == "heartbeat":
+            try:
+                data = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+
+            if "text" in data:
+                raw_message = data["text"]
+            elif "bytes" in data:
+                try:
+                    raw_message = data["bytes"].decode("utf-8")
+                except Exception:
+                    logger.debug("Control channel received non-decodable bytes; ignoring")
+                    continue
+            else:
                 continue
-            await connection_manager.relay_control_from_viewer(websocket, message)
+
+            print("FROM VIEWER:", repr(raw_message))
+            if isinstance(raw_message, str) and raw_message.strip() in (None, "", "heartbeat", "ping", "pong"):
+                logger.debug("Control channel ignored payload: %r", raw_message)
+                continue
+            logger.debug("Control channel received payload: %r", raw_message)
+            # Forward the raw text verbatim
+            await connection_manager.relay_control_from_viewer(websocket, raw_message)
     except WebSocketDisconnect:
         pass
     finally:
@@ -535,7 +780,38 @@ async def ws_control_host_endpoint(websocket: WebSocket, device_id: str):
 
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                data = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+
+            if "text" in data:
+                raw_message = data["text"]
+            elif "bytes" in data:
+                try:
+                    raw_message = data["bytes"].decode("utf-8")
+                except Exception:
+                    logger.debug("Control host sent non-decodable bytes; ignoring")
+                    continue
+            else:
+                continue
+
+            print("FROM HOST:", repr(raw_message))
+            if isinstance(raw_message, str) and raw_message.strip() in (None, "", "heartbeat", "ping", "pong"):
+                logger.debug("Control host ignored payload: %r", raw_message)
+                continue
+
+            # Forward host-sent control messages to all connected control viewers for this device
+            viewers = list(connection_manager.control_viewers.get(device_id, []))
+            coros = []
+            for ws in viewers:
+                try:
+                    coros.append(ws.send_text(raw_message))
+                    print("FORWARD TO VIEWER:", repr(raw_message))
+                except Exception:
+                    pass
+            if coros:
+                await asyncio.gather(*coros, return_exceptions=True)
     except WebSocketDisconnect:
         pass
     finally:

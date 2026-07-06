@@ -136,6 +136,7 @@ class ControlWSClientThread(QThread):
         self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
         self.ws: Optional[websocket.WebSocketApp] = None
         self.running = True
+        self._input_latency_samples = []
 
     def _build_ws_endpoint(self, path: str) -> str:
         url = f"{self.ws_url}{path}"
@@ -175,21 +176,13 @@ class ControlWSClientThread(QThread):
     def on_error(self, ws, error):
         logger.error(f"Control tunnel socket error: {error}")
 
-    def __init__(self, ws_url: str, device_id: str, auth_token: Optional[str] = None):
-        super().__init__()
-        self.ws_url = ws_url
-        self.device_id = device_id
-        self.auth_token = auth_token or os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN")
-        self.ws: Optional[websocket.WebSocketApp] = None
-        self.running = True
-        self._input_latency_samples = []
-
     def send_action(self, msg_type: str, payload: dict):
         if self.ws and self.ws.sock and self.ws.sock.connected:
             try:
                 # Keep input traffic on the dedicated control tunnel so it bypasses screen-frame backpressure.
                 send_started = time.perf_counter()
                 packet = json.dumps({"type": msg_type, "payload": payload})
+                print(packet)
                 self.ws.send(packet)
                 latency_ms = (time.perf_counter() - send_started) * 1000.0
                 self._record_input_latency(latency_ms)
