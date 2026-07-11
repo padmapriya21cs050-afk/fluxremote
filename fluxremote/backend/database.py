@@ -125,6 +125,11 @@ def register_device(device_id: str, device_name: str, password_hash: str, owner_
             owner_id = user["id"]
             
     try:
+        print("--------------------------------")
+        print("DATABASE STORE")
+        print(f"device_id={device_id}")
+        print(f"password_hash={password_hash}")
+        print("--------------------------------")
         cursor.execute(
             """
             INSERT INTO devices (device_id, device_name, access_password_hash, owner_id, is_online, last_seen)

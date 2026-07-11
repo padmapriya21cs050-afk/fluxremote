@@ -13,30 +13,58 @@ import socket
 import logging
 import threading
 import ctypes
+import atexit
+import signal
+import traceback
 from urllib.parse import quote
 from typing import Dict, Any, Optional
+
+# Set up logging before imports so failures can be logged clearly
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] Host: %(message)s")
+logger = logging.getLogger("fluxremote.host")
 
 # Required external packages
 try:
     import mss
     import pyautogui
-    from PIL import Image
+    from PIL import Image, ImageDraw
     import io
     import websocket
     import requests
-    import psutil
-    from pynput.mouse import Controller as PynputMouseController, Button as PynputButton
-except ImportError:
-    print("Warning: Missing required packages. Run: pip install mss pyautogui pillow websocket-client requests pynput psutil")
+except Exception as exc:
+    print("Failed to import core host packages. See traceback below:")
+    print(f"Import error: {exc}")
+    traceback.print_exc()
+    logger.exception("Import of core host package failed: %s", exc)
     pyautogui = None
+    ImageDraw = None
+
+try:
+    import psutil
+except Exception as exc:
+    logger.warning("psutil is unavailable; continuing without host stats support: %s", exc)
     psutil = None
+
+try:
+    from pynput.mouse import Controller as PynputMouseController, Button as PynputButton
+    from pynput.keyboard import Controller as PynputKeyboardController, Key as PynputKey
+except Exception as exc:
+    print("Failed to import pynput input controllers. See traceback below:")
+    print(f"Import error: {exc}")
+    traceback.print_exc()
+    logger.exception("Import of pynput input controllers failed: %s", exc)
     PynputMouseController = None
     PynputButton = None
-    # We will still generate the complete file for compilation/packaging
+    PynputKeyboardController = None
+    PynputKey = None
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] Host: %(message)s")
-logger = logging.getLogger("fluxremote.host")
+try:
+    import pystray
+except Exception as exc:
+    logger.warning("pystray is unavailable; tray icon support disabled: %s", exc)
+    pystray = None
+    if ImageDraw is None:
+        ImageDraw = None
 
 # PyAutoGUI Safety settings
 if pyautogui is not None:
@@ -71,14 +99,27 @@ class FluxHost:
         self.reject_frame = False
         self.current_resolution = (0, 0)
 
-        self.pynput_enabled = PynputMouseController is not None
-        self.mouse_controller = PynputMouseController() if self.pynput_enabled else None
+        self.pynput_mouse_available = PynputMouseController is not None
+        self.pynput_keyboard_available = PynputKeyboardController is not None
+        self.mouse_controller = None
+        self.keyboard_controller = None
+        self._init_input_controllers()
         
         # Threads
         self.capture_thread: Optional[threading.Thread] = None
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.control_thread: Optional[threading.Thread] = None
         self.stats_thread: Optional[threading.Thread] = None
+        self.tray_thread: Optional[threading.Thread] = None
+        
+        # Tray and background settings
+        self.tray_enabled = False
+        self.tray_icon = None
+
+        # Local input blocking state
+        self.block_local_input_enabled = False
+        self.local_input_blocked = False
+        self.remote_viewer_active = False
         
         # Performance metrics
         self.frame_count = 0
@@ -86,6 +127,143 @@ class FluxHost:
         self.current_fps = 0
         self.last_stats_sent = 0.0
         self.input_latency_samples = []
+        
+        self._register_exit_handlers()
+
+    def _register_exit_handlers(self):
+        atexit.register(self._unblock_local_input)
+        try:
+            signal.signal(signal.SIGINT, self._on_exit_signal)
+            signal.signal(signal.SIGTERM, self._on_exit_signal)
+        except Exception:
+            pass
+
+    def _init_input_controllers(self):
+        print("--------------------------------------------------")
+        print("Initializing input controllers")
+        print("\nMouse controller:")
+        print(repr(self.mouse_controller))
+        print("\nKeyboard controller:")
+        print(repr(self.keyboard_controller))
+        print("--------------------------------------------------")
+
+        if self.pynput_mouse_available and self.mouse_controller is None:
+            try:
+                self.mouse_controller = PynputMouseController()
+                logger.info("Initialized Pynput mouse controller: %s", type(self.mouse_controller).__name__)
+                print("Mouse controller initialized successfully")
+            except Exception as exc:
+                logger.warning("Failed to initialize Pynput mouse controller: %s", exc)
+                print("Mouse controller initialization FAILED")
+                traceback.print_exc()
+                raise
+        else:
+            if self.mouse_controller is not None:
+                print("Mouse controller already initialized")
+            else:
+                print("Mouse controller not available")
+
+        if self.pynput_keyboard_available and self.keyboard_controller is None:
+            try:
+                self.keyboard_controller = PynputKeyboardController()
+                logger.info("Initialized Pynput keyboard controller: %s", type(self.keyboard_controller).__name__)
+                print("Keyboard controller initialized successfully")
+            except Exception as exc:
+                logger.warning("Failed to initialize Pynput keyboard controller: %s", exc)
+                print("Keyboard controller initialization FAILED")
+                traceback.print_exc()
+                raise
+        else:
+            if self.keyboard_controller is not None:
+                print("Keyboard controller already initialized")
+            else:
+                print("Keyboard controller not available")
+
+    def _on_exit_signal(self, signum, frame):
+        logger.info("Exit signal received (%s). Stopping host.", signum)
+        self.stop()
+        self._unblock_local_input()
+        sys.exit(0)
+
+    def _create_tray_icon_image(self):
+        if ImageDraw is None:
+            return None
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 8, 56, 56), fill=(0, 122, 204, 255))
+        draw.rectangle((24, 24, 40, 40), fill="white")
+        return image
+
+    def _on_tray_exit(self, icon, item):
+        logger.info("Tray exit requested.")
+        self.stop()
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+    def _init_tray_icon(self):
+        if not self.tray_enabled:
+            return
+        if pystray is None or ImageDraw is None:
+            logger.warning("Tray icon requested but pystray is unavailable. Install pystray to enable tray icon support.")
+            return
+        if self.tray_icon:
+            return
+
+        icon_image = self._create_tray_icon_image()
+        if icon_image is None:
+            return
+
+        try:
+            self.tray_icon = pystray.Icon(
+                "FluxRemoteHost",
+                icon_image,
+                "FluxRemote Host",
+                menu=pystray.Menu(pystray.MenuItem("Exit", self._on_tray_exit))
+            )
+            self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+            self.tray_thread.start()
+        except Exception as exc:
+            logger.warning(f"Failed to initialize tray icon: {exc}")
+            self.tray_icon = None
+
+    def _destroy_tray_icon(self):
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+    def _block_local_input(self, enabled: bool):
+        if not self.block_local_input_enabled or not sys.platform.startswith("win"):
+            return
+        try:
+            success = ctypes.windll.user32.BlockInput(1 if enabled else 0)
+            if success:
+                self.local_input_blocked = enabled
+                logger.info("Local input %s.", "blocked" if enabled else "restored")
+            else:
+                logger.warning("Unable to %s local input. Administrative privileges may be required.", "block" if enabled else "restore")
+        except Exception as exc:
+            logger.error(f"Local input block failed: {exc}")
+
+    def _unblock_local_input(self):
+        if not self.local_input_blocked:
+            return
+        try:
+            ctypes.windll.user32.BlockInput(0)
+        except Exception:
+            pass
+        self.local_input_blocked = False
+        logger.info("Local input restored.")
+
+    def _update_local_input_state(self):
+        if self.block_local_input_enabled and self.remote_viewer_active and self.connected:
+            self._block_local_input(True)
+        else:
+            self._unblock_local_input()
 
     def _build_ws_url(self, path: str) -> str:
         url = f"{self.server_url}{path}"
@@ -103,6 +281,11 @@ class FluxHost:
             "device_name": self.device_name,
             "access_password": self.access_password
         }
+        print("--------------------------------")
+        print("HOST REGISTER")
+        print(f"device_id={self.device_id}")
+        print(f"access_password={repr(self.access_password)}")
+        print("--------------------------------")
         try:
             # Swap ws:// with http:// or wss:// with https://
             http_url = self.server_url.replace("ws://", "http://").replace("wss://", "https://")
@@ -126,6 +309,7 @@ class FluxHost:
             logger.warning("Continuing starting procedures, but server registration failed. Port may be offline.")
             
         self.running = True
+        self._init_tray_icon()
         
         # Build WS URL
         ws_endpoint = self._build_ws_url(f"/ws/host/{self.device_id}")
@@ -150,6 +334,8 @@ class FluxHost:
 
     def stop(self):
         self.running = False
+        self._unblock_local_input()
+        self._destroy_tray_icon()
         if self.ws:
             self.ws.close()
         if self.control_ws:
@@ -206,6 +392,7 @@ class FluxHost:
 
     def on_control_open(self, ws):
         logger.info("Control tunnel connected.")
+        self._init_input_controllers()
 
     def on_control_message(self, ws, message):
         self._handle_control_message(message)
@@ -219,6 +406,7 @@ class FluxHost:
     def on_close(self, ws, close_status_code, close_msg):
         logger.warning(f"WebSocket closed. Code: {close_status_code}, Message: {close_msg}")
         self.connected = False
+        self._update_local_input_state()
 
     def on_error(self, ws, error):
         logger.error(f"WebSocket transport error: {error}")
@@ -226,9 +414,16 @@ class FluxHost:
     def _move_mouse(self, x: int, y: int):
         x = int(x)
         y = int(y)
+        print("Moving cursor to:")
+        print(f"x={x}")
+        print(f"y={y}")
 
-        if self.pynput_enabled and self.mouse_controller:
+        if self.pynput_mouse_available and self.mouse_controller is None:
+            self._init_input_controllers()
+
+        if self.pynput_mouse_available and self.mouse_controller:
             try:
+                logger.debug("Mouse move controller: %s", type(self.mouse_controller).__name__)
                 self.mouse_controller.position = (x, y)
                 return
             except Exception as exc:
@@ -251,23 +446,112 @@ class FluxHost:
         logger.warning("Mouse movement fallback exhausted; cursor may be slow or unavailable.")
 
     def _click_mouse(self, button: str = "left"):
-        if self.pynput_enabled and self.mouse_controller:
+        print("--------------------------------------------------")
+        print("CLICK REQUEST")
+        print(f"button={button}")
+        print()
+        print(f"mouse_controller={repr(self.mouse_controller)}")
+        print(f"mouse_controller_type={type(self.mouse_controller)}")
+        print(f"pynput_available={self.pynput_mouse_available}")
+        print()
+        print(f"pyautogui_available={pyautogui is not None}")
+        print("--------------------------------------------------")
+
+        if self.pynput_mouse_available and self.mouse_controller is None:
+            self._init_input_controllers()
+
+        if self.pynput_mouse_available and self.mouse_controller is not None:
             try:
-                btn = PynputButton.left if button == "left" else PynputButton.right if button == "right" else PynputButton.middle
-                self.mouse_controller.click(btn)
+                print("About to execute pynput click")
+                self.mouse_controller.click(PynputButton.left if button == "left" else PynputButton.right if button == "right" else PynputButton.middle)
+                print("Pynput click succeeded")
+                logger.info("Executing mouse click with controller: %s", type(self.mouse_controller).__name__)
+                logger.info("Mouse click executed successfully with %s", type(self.mouse_controller).__name__)
                 return
-            except Exception:
-                pass
-        pyautogui.click(button=button)
+            except Exception as exc:
+                logger.warning("Pynput mouse click failed: %s", exc)
+                traceback.print_exc()
+
+        if pyautogui is not None:
+            print("Falling back to pyautogui")
+            logger.info("Falling back to pyautogui click for button=%s", button)
+            try:
+                pyautogui.click(button=button)
+                print("pyautogui click succeeded")
+                logger.info("PyAutoGUI click executed successfully for button=%s", button)
+                return
+            except Exception as exc:
+                logger.warning("PyAutoGUI click failed: %s", exc)
+                traceback.print_exc()
+
+        if sys.platform.startswith("win"):
+            print("Falling back to native Win32 click")
+            logger.warning("Falling back to native Windows click for button=%s", button)
+            try:
+                import ctypes as _ctypes
+                if button == "right":
+                    _ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+                    _ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+                else:
+                    _ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                    _ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                print("Win32 click succeeded")
+                logger.info("Native Windows click executed successfully for button=%s", button)
+                return
+            except Exception as exc:
+                logger.error("Native Windows click failed: %s", exc)
+                traceback.print_exc()
+
+        if sys.platform.startswith("win"):
+            logger.warning("Falling back to native Windows click for button=%s", button)
+            try:
+                import ctypes as _ctypes
+                if button == "right":
+                    _ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+                    _ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+                else:
+                    _ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                    _ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                logger.info("Native Windows click executed successfully for button=%s", button)
+                return
+            except Exception as exc:
+                logger.error("Native Windows click failed: %s", exc)
+
+        logger.error("Unable to execute mouse click: no controller available and pyautogui unavailable.")
+
+        if sys.platform.startswith("win"):
+            logger.warning("Falling back to native Windows click for button=%s", button)
+            try:
+                import ctypes
+                if button == "right":
+                    ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)  # RIGHTDOWN
+                    ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # RIGHTUP
+                else:
+                    ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+                    ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+                logger.info("Native Windows click executed successfully for button=%s", button)
+                return
+            except Exception as exc:
+                logger.error("Native Windows click failed: %s", exc)
+
+        logger.error("Unable to execute mouse click: no controller and pyautogui unavailable.")
 
     def _double_click_mouse(self):
-        if self.pynput_enabled and self.mouse_controller:
+        if self.pynput_mouse_available and self.mouse_controller is None:
+            self._init_input_controllers()
+
+        if self.pynput_mouse_available and self.mouse_controller:
             try:
+                logger.info("Executing mouse double click with controller: %s", type(self.mouse_controller).__name__)
                 self.mouse_controller.click(PynputButton.left, 2)
+                logger.info("Mouse double click executed successfully with %s", type(self.mouse_controller).__name__)
                 return
-            except Exception:
-                pass
-        pyautogui.doubleClick()
+            except Exception as exc:
+                logger.warning("Pynput mouse double click failed: %s", exc)
+
+        if pyautogui is not None:
+            logger.info("Falling back to pyautogui doubleClick")
+            pyautogui.doubleClick()
 
     def _record_input_latency(self, latency_ms: float, msg_type: str):
         self.input_latency_samples.append((msg_type, latency_ms))
@@ -302,7 +586,17 @@ class FluxHost:
 
             msg_type = data.get("type")
             payload = data.get("payload", {})
-            
+            print("--------------------------------------------------")
+            print("RAW CONTROL MESSAGE:")
+            print(message)
+            print()
+            print("PARSED TYPE:")
+            print(msg_type)
+            print()
+            print("PAYLOAD:")
+            print(payload)
+            print("--------------------------------------------------")
+
             if msg_type == "fps_update":
                 self.fps = max(1, min(60, int(payload.get("fps", 15))))
                 logger.info(f"Stream target FPS updated to {self.fps}")
@@ -313,14 +607,18 @@ class FluxHost:
                 
             elif msg_type == "viewer_status":
                 status = payload.get("status")
+                self.remote_viewer_active = status == "connected"
                 logger.info(f"Viewer status changed: {status}")
+                self._update_local_input_state()
                 
             elif msg_type == "mouse_move":
+                print("Executing mouse_move")
                 x = int(payload.get("x", 0))
                 y = int(payload.get("y", 0))
                 self._move_mouse(x, y)
                 
             elif msg_type == "mouse_click":
+                print("Executing mouse_click")
                 x = payload.get("x")
                 y = payload.get("y")
                 if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -329,6 +627,7 @@ class FluxHost:
                 self._click_mouse(button)
                 
             elif msg_type == "mouse_double_click":
+                print("Executing mouse_double_click")
                 x = payload.get("x")
                 y = payload.get("y")
                 if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -340,21 +639,24 @@ class FluxHost:
                     pyautogui.rightClick()
                 
             elif msg_type == "mouse_scroll":
+                print("Executing mouse_scroll")
                 amount = int(payload.get("amount", 0))
                 # On Windows scroll is positive for up, negative for down
                 if pyautogui is not None:
                     pyautogui.scroll(amount)
                 
             elif msg_type == "key_press":
+                print("Executing key_press")
                 key = payload.get("key")
                 if key and pyautogui is not None:
                     pyautogui.press(key)
                     
             elif msg_type == "key_shortcut":
+                print("Executing key_shortcut")
                 keys = payload.get("keys", [])
                 if keys and pyautogui is not None:
                     pyautogui.hotkey(*keys)
-                    
+                
             elif msg_type == "clipboard_sync":
                 text = payload.get("text", "")
                 if text:
@@ -366,7 +668,13 @@ class FluxHost:
                         pass
                         
         except Exception as e:
-            logger.error(f"Failed to execute incoming Viewer control event: {e}")
+            import traceback
+            logger.exception("Viewer control execution failed")
+            print("=" * 80)
+            print("CONTROL EVENT FAILED")
+            print(message)
+            print("=" * 80)
+            traceback.print_exc()
         finally:
             # Measure the host-side cost of processing input so we can debug responsiveness without changing the protocol.
             if msg_type in {"mouse_move", "mouse_click", "mouse_double_click", "mouse_right_click", "mouse_scroll", "key_press", "key_shortcut"}:
@@ -477,11 +785,13 @@ if __name__ == "__main__":
     parser.add_argument("--password", default="1234567", help="Target access password")
     parser.add_argument("--auth-token", default=os.environ.get("FLUXREMOTE_TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN"), help="Optional auth token for tunnelled websocket connections")
     parser.add_argument("--hide-console", action="store_true", help="Hide the Windows console window when launching the host")
+    parser.add_argument("--background", action="store_true", help="Run without a visible console window on Windows")
+    parser.add_argument("--tray", action="store_true", help="Show a tray icon while the host runs")
+    parser.add_argument("--block-local-input", action="store_true", help="Temporarily disable local mouse and keyboard while a remote viewer is connected")
     args = parser.parse_args()
-    
-    if args.hide_console and sys.platform.startswith("win"):
+
+    if (args.hide_console or args.background) and sys.platform.startswith("win"):
         try:
-            import ctypes
             kernel32 = ctypes.windll.kernel32
             user32 = ctypes.windll.user32
             hwnd = kernel32.GetConsoleWindow()
@@ -490,13 +800,15 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    print("------------------------------------------")
-    print("       FLUXREMOTE WINDOWS HOST AGENT     ")
-    print(f"       Device ID: {args.id}")
-    print(f"       Server: {args.server}")
-    print("------------------------------------------")
-    
+    logger.info("------------------------------------------")
+    logger.info("       FLUXREMOTE WINDOWS HOST AGENT     ")
+    logger.info("       Device ID: %s", args.id)
+    logger.info("       Server: %s", args.server)
+    logger.info("------------------------------------------")
+
     host = FluxHost(server_url=args.server, device_id=args.id, access_password=args.password, tunnel_token=args.auth_token)
+    host.tray_enabled = args.tray
+    host.block_local_input_enabled = args.block_local_input
     try:
         host.start()
     except KeyboardInterrupt:

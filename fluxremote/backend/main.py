@@ -14,6 +14,7 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Dict, Set, Optional, List
+from pydantic import BaseModel
 from dotenv import load_dotenv, find_dotenv
 from google import genai
 
@@ -36,8 +37,11 @@ def _load_dotenv_paths() -> List[str]:
     loaded_files: List[str] = []
     env_paths = [
         os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(__file__), ".env.local"),
         os.path.join(os.path.dirname(__file__), "..", ".env"),
+        os.path.join(os.path.dirname(__file__), "..", ".env.local"),
         os.path.join(os.path.dirname(__file__), "..", "..", ".env"),
+        os.path.join(os.path.dirname(__file__), "..", "..", ".env.local"),
     ]
 
     for path in env_paths:
@@ -56,14 +60,15 @@ def _load_dotenv_paths() -> List[str]:
     return loaded_files
 
 
-_load_dotenv_paths()
+LOADED_ENV_FILES = _load_dotenv_paths()
 
 
 def get_gemini_api_key() -> Optional[str]:
     return os.getenv("GEMINI_API_KEY")
 
 
-logger.info("Gemini API key detected: %s", "YES" if get_gemini_api_key() else "NO")
+logger.info("GEMINI_API_KEY found: %s", "YES" if get_gemini_api_key() else "NO")
+logger.info("Dotenv files loaded for Gemini config: %s", ", ".join(LOADED_ENV_FILES) if LOADED_ENV_FILES else "None")
 
 app = FastAPI(
     title="FluxRemote Signalling and Relay Server",
@@ -178,6 +183,68 @@ class GeminiAssistant:
             logger.error("Gemini assistant request failure: %s", exc)
             return "Unable to reach Gemini for assistant analysis: Gemini API request failed."
 
+    @staticmethod
+    def chat(message: str, history: Optional[List[Dict[str, str]]] = None, context: Optional[Dict[str, Any]] = None) -> str:
+        api_key = get_gemini_api_key()
+        if not api_key:
+            logger.error("Gemini chat request blocked: missing GEMINI_API_KEY.")
+            return "Gemini is not configured right now, but I can still help. Please try again shortly or ask a simpler question."
+
+        client = GeminiClient(api_key)
+
+        try:
+            history_lines = []
+            if history:
+                for item in history[-10:]:
+                    role = item.get("role", "user")
+                    content = item.get("content", "")
+                    if content:
+                        history_lines.append(f"{role}: {content}")
+
+            context_lines = []
+            if context:
+                for key, value in context.items():
+                    if isinstance(value, (dict, list)):
+                        context_lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                    else:
+                        context_lines.append(f"{key}: {value}")
+
+            prompt = f"""
+            You are FluxRemote AI Copilot, a helpful assistant for a remote desktop product.
+            Answer any user question clearly and helpfully, including programming, Windows/Linux troubleshooting, networking, AI, mathematics, writing, and general knowledge.
+            If the user asks about FluxRemote, explain how to troubleshoot the connection or use the product. Keep answers concise, practical, and friendly.
+
+            Recent conversation:
+            {chr(10).join(history_lines) if history_lines else 'None'}
+
+            Session context:
+            {chr(10).join(context_lines) if context_lines else 'None'}
+
+            User message:
+            {message}
+            """
+            answer = client.generate(prompt)
+            reply = _extract_gemini_text(answer)
+            if reply:
+                return reply
+
+            logger.error("Gemini chat returned empty or unexpected response: %s", answer)
+            return "I’m here to help. Gemini returned an empty response, so please try again with a slightly different question."
+        except Exception as exc:
+            logger.error("Gemini chat request failure: %s", exc)
+            return "I’m sorry, the AI service is currently unavailable. Please try again in a moment."
+
+
+GEMINI_CLIENT_INITIALIZED = False
+if get_gemini_api_key():
+    try:
+        GeminiClient(get_gemini_api_key())
+        GEMINI_CLIENT_INITIALIZED = True
+    except Exception as exc:
+        logger.error("Gemini SDK client initialization failed at startup: %s", exc)
+
+logger.info("Gemini client initialized successfully: %s", "YES" if GEMINI_CLIENT_INITIALIZED else "NO")
+
 # Enable CORS for frontend and API usage
 app.add_middleware(
     CORSMiddleware,
@@ -193,6 +260,18 @@ def startup_event():
     db.init_db()
     logger.info("FluxRemote Backend started and database schema validated.")
 
+class AIChatRequest(BaseModel):
+    message: str
+    history: Optional[List[Dict[str, str]]] = None
+    session_id: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+
+class AIChatResponse(BaseModel):
+    reply: str
+    fallback: bool = False
+
+
 # --- HTTP ENDPOINTS ---
 
 @app.get("/")
@@ -207,12 +286,42 @@ def read_root():
 def register_device(device: DeviceRegister):
     # Hashes the password used for connecting to the host
     hash_pwd = auth.hash_password(device.access_password)
+    print("=" * 80)
+    print("REGISTER DEVICE")
+    print(f"  device_id={repr(device.device_id)}")
+    print(f"  received_password={repr(device.access_password)}")
+    print(f"  generated_hash={repr(hash_pwd)}")
+    print("=" * 80)
+    logger.info("REGISTER DEVICE | device_id=%s | password_len=%d | hash_len=%d", 
+                device.device_id, len(device.access_password) if device.access_password else 0, len(hash_pwd))
+    
     success = db.register_device(device.device_id, device.device_name, hash_pwd)
     if not success:
         raise HTTPException(
             status_code=500,
             detail="Failed to register or update device configuration."
         )
+    
+    # Verify the hash was stored correctly
+    stored_device = db.get_device(device.device_id)
+    if stored_device:
+        stored_hash = stored_device.get("access_password_hash")
+        verify_result = auth.verify_password(device.access_password, stored_hash)
+        print("-" * 80)
+        print("REGISTER DEVICE: Post-insert verification")
+        print(f"  stored_hash_after_insert={repr(stored_hash)}")
+        print(f"  verify_password(received_password, stored_hash)={verify_result}")
+        print(f"  received_password={repr(device.access_password)}")
+        print("-" * 80)
+        logger.info("REGISTER DEVICE: Post-insert verification | verify_result=%s | hash_match=%s", 
+                    verify_result, stored_hash == hash_pwd)
+    else:
+        print("-" * 80)
+        print("REGISTER DEVICE: WARNING - Device not found in DB after insert!")
+        print(f"  device_id={repr(device.device_id)}")
+        print("-" * 80)
+        logger.error("REGISTER DEVICE: Device not found after registration | device_id=%s", device.device_id)
+    
     return {
         "message": "Device registered successfully.",
         "device_id": device.device_id,
@@ -222,6 +331,36 @@ def register_device(device: DeviceRegister):
 @app.get("/api/devices/online")
 def list_online_devices():
     return db.get_online_devices()
+
+@app.post("/api/ai/chat", response_model=AIChatResponse)
+def ai_chat(request: AIChatRequest):
+    """Chat endpoint for the FluxRemote AI Copilot."""
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="A non-empty message is required.")
+
+    reply = GeminiAssistant.chat(
+        request.message.strip(),
+        history=request.history,
+        context=request.context,
+    )
+    fallback = "Gemini is not configured right now" in reply or "currently unavailable" in reply or "empty response" in reply
+    return AIChatResponse(reply=reply, fallback=fallback)
+
+
+@app.post("/api/copilot/chat", response_model=AIChatResponse)
+def copilot_chat(request: AIChatRequest):
+    """Session-scoped copilot endpoint for the remote session AI card."""
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="A non-empty message is required.")
+
+    reply = GeminiAssistant.chat(
+        request.message.strip(),
+        history=request.history,
+        context=request.context,
+    )
+    fallback = "Gemini is not configured right now" in reply or "currently unavailable" in reply or "empty response" in reply
+    return AIChatResponse(reply=reply, fallback=fallback)
+
 
 @app.post("/api/ai/explain")
 def ai_explain_issue(request: Dict[str, Any]):
@@ -253,32 +392,77 @@ def ai_explain_issue(request: Dict[str, Any]):
 def create_session(session_req: SessionCreate):
     device_id = session_req.device_id
     supplied_password = session_req.access_password
-    print(f"Session create request device_id={device_id}")
-    logger.info("Session create request device_id=%s", device_id)
+    
+    print("=" * 80)
+    print("CREATE_SESSION: Entry point")
+    print(f"  received_device_id={repr(device_id)}")
+    print(f"  supplied_password={repr(supplied_password)}")
+    print("=" * 80)
+    logger.info("CREATE_SESSION: Entry point | device_id=%s | password_len=%d", device_id, len(supplied_password) if supplied_password else 0)
 
     device = db.get_device(device_id)
-    device_exists = device is not None
-    print(f"Device exists in DB: {device_exists}")
-    logger.info("Device exists in DB: %s", device_exists)
+    
+    print("-" * 80)
+    print("CREATE_SESSION: After db.get_device()")
+    print(f"  device_found={device is not None}")
+    if device:
+        print(f"  stored_password_hash={repr(device['access_password_hash'])}")
+        print(f"  device_is_online={device['is_online']}")
+    else:
+        print(f"  stored_password_hash=N/A (device not found)")
+        print(f"  device_is_online=N/A")
+    print("-" * 80)
+    logger.info("CREATE_SESSION: db.get_device() result | found=%s", device is not None)
 
     if not device:
-        logger.info("403 because device not found for device_id=%s", device_id)
-        print(f"403 because device not found for device_id={device_id}")
+        print("!" * 80)
+        print("EARLY RETURN: HTTP 404")
+        print(f"  reason=device_not_found")
+        print(f"  device_id={repr(device_id)}")
+        print("!" * 80)
+        logger.info("EARLY RETURN: HTTP 404 | device_not_found | device_id=%s", device_id)
         raise HTTPException(status_code=404, detail="Target device not registered.")
 
     if not device["is_online"]:
-        logger.info("403 because device offline for device_id=%s", device_id)
-        print(f"403 because device offline for device_id={device_id}")
+        print("!" * 80)
+        print("EARLY RETURN: HTTP 400")
+        print(f"  reason=device_offline")
+        print(f"  device_id={repr(device_id)}")
+        print(f"  device_is_online={device['is_online']}")
+        print("!" * 80)
+        logger.info("EARLY RETURN: HTTP 400 | device_offline | device_id=%s | is_online=%s", device_id, device["is_online"])
         raise HTTPException(status_code=400, detail="Target host desktop is currently offline.")
 
     password_matches = auth.verify_password(supplied_password, device["access_password_hash"])
-    print(f"Password matches: {password_matches}")
-    logger.info("Password matches: %s", password_matches)
+    
+    print("-" * 80)
+    print("CREATE_SESSION: Password verification result")
+    print(f"  verify_password() returned={password_matches}")
+    print(f"  received_password={repr(supplied_password)}")
+    print(f"  stored_hash={repr(device['access_password_hash'])}")
+    print("-" * 80)
+    logger.info("CREATE_SESSION: Password verification | result=%s | supplied_len=%d | hash_len=%d", 
+                password_matches, len(supplied_password) if supplied_password else 0, 
+                len(device["access_password_hash"]) if device.get("access_password_hash") else 0)
 
     if not password_matches:
-        logger.info("403 because password verification failed for device_id=%s", device_id)
-        print(f"403 because password verification failed for device_id={device_id}")
+        print("!" * 80)
+        print("EARLY RETURN: HTTP 403")
+        print(f"  reason=password_verification_failed")
+        print(f"  device_id={repr(device_id)}")
+        print(f"  verify_password()={password_matches}")
+        print(f"  received_password={repr(supplied_password)}")
+        print(f"  stored_hash={repr(device['access_password_hash'])}")
+        print("!" * 80)
+        logger.info("EARLY RETURN: HTTP 403 | password_verification_failed | device_id=%s | verify_result=%s", device_id, password_matches)
         raise HTTPException(status_code=403, detail="Invalid access password.")
+
+    print("=" * 80)
+    print("CREATE_SESSION: All checks passed, creating session")
+    print(f"  device_id={repr(device_id)}")
+    print(f"  password_matches=True")
+    print("=" * 80)
+    logger.info("CREATE_SESSION: All checks passed | device_id=%s", device_id)
 
     logger.info("Session creation accepted for device_id=%s", device_id)
 
@@ -352,11 +536,14 @@ class ConnectionManager:
             self.viewers[device_id] = set()
         self.viewers[device_id].add(websocket)
         self.viewer_targets[websocket] = device_id
+        viewer_keys = sorted(self.viewers.keys())
+        print(f"REGISTER_VIEWER device={device_id}")
+        print(f"Total viewers after registration: {len(self.viewers[device_id])}")
+        print(f"Viewer websocket id: {id(websocket)}")
+        print(f"Viewer dictionary keys: {viewer_keys}")
         logger.info("Viewer connected: %s", device_id)
         print(f"Viewer connected: {device_id}")
-        viewer_keys = sorted(self.viewers.keys())
         logger.info("Viewer dictionary keys after connection: %s", viewer_keys)
-        print(f"Viewer dictionary keys after connection: {viewer_keys}")
         logger.info("Viewer connected to desktop %s. Total viewers: %d", device_id, len(self.viewers[device_id]))
 
         # Notify host that a viewer joined
@@ -369,23 +556,30 @@ class ConnectionManager:
         return True
 
     async def unregister_viewer(self, websocket: WebSocket):
-        if websocket in self.viewer_targets:
-            device_id = self.viewer_targets[websocket]
-            if device_id in self.viewers:
-                self.viewers[device_id].discard(websocket)
-                if not self.viewers[device_id]:
-                    del self.viewers[device_id]
-                    print(f"Viewer dictionary key removed: {device_id}")
-                    logger.info("Viewer dictionary key removed: %s", device_id)
-                    # Inform host that all viewers disconnected
-                    if device_id in self.hosts:
-                        try:
-                            await self.hosts[device_id].send_text(json.dumps({"type": "viewer_status", "status": "disconnected"}))
-                        except Exception:
-                            pass
-            del self.viewer_targets[websocket]
-            logger.info("Viewer disconnected: %s", device_id)
-            print(f"Viewer disconnected: {device_id}")
+        device_id = self.viewer_targets.get(websocket, "unknown")
+        print(f"UNREGISTER_VIEWER device={device_id}")
+        try:
+            if websocket in self.viewer_targets:
+                if device_id in self.viewers:
+                    self.viewers[device_id].discard(websocket)
+                    if not self.viewers[device_id]:
+                        del self.viewers[device_id]
+                        print(f"Viewer dictionary key removed: {device_id}")
+                        logger.info("Viewer dictionary key removed: %s", device_id)
+                        # Inform host that all viewers disconnected
+                        if device_id in self.hosts:
+                            try:
+                                await self.hosts[device_id].send_text(json.dumps({"type": "viewer_status", "status": "disconnected"}))
+                            except Exception:
+                                pass
+                del self.viewer_targets[websocket]
+                logger.info("Viewer disconnected: %s", device_id)
+                print(f"Viewer disconnected: {device_id}")
+            print("Remaining viewers:", self.viewers.get(device_id, set()) if device_id != "unknown" else set())
+        except Exception as exc:
+            print(f"UNREGISTER_VIEWER exception for device={device_id}: {exc}")
+            traceback.print_exc()
+            raise
 
     async def register_host_control(self, device_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -431,28 +625,52 @@ class ConnectionManager:
         if device_id in self.viewers:
             targets = list(self.viewers[device_id])
             size = len(message) if isinstance(message, (bytes, bytearray)) else len(str(message))
-            
+            viewer_count = len(targets)
+
+            print("----------------------------------------------------")
+            print("HOST FRAME RECEIVED")
+            print(f"device={device_id}")
+            print(f"frame_size={size}")
+            print(f"viewer_count={viewer_count}")
+            print("----------------------------------------------------")
+
+            if isinstance(message, (bytes, bytearray)):
+                print(f"JPEG SIZE = {len(message)} bytes")
+            else:
+                print(f"JPEG SIZE = {len(str(message))} bytes")
+
+            if viewer_count == 0:
+                print("No viewers registered for this device.")
+
             # Record statistics
             self.bytes_transferred[device_id] = self.bytes_transferred.get(device_id, 0) + size
-            
+
             # Send to all active viewers
             coros = []
             for ws in targets:
+                print(f"viewer websocket id: {id(ws)}")
+                print(f"viewer websocket client_state: {getattr(ws, 'client_state', None)}")
+                print(f"viewer websocket application_state: {getattr(ws, 'application_state', None)}")
+                is_connected = str(getattr(ws, 'client_state', None)) == 'CONNECTED'
+                if not is_connected:
+                    print("Skipping disconnected viewer.")
                 try:
                     if isinstance(message, bytes):
                         logger.info("Host binary frame received for device %s size=%d bytes", device_id, len(message))
-                        print("FROM HOST:", repr(message))
                         coros.append(ws.send_bytes(message))
                         logger.info("Forwarding host binary frame to viewer for device %s size=%d bytes", device_id, len(message))
-                        print("FORWARD TO VIEWER:", repr(message))
                     else:
-                        print("FROM HOST:", repr(message))
                         coros.append(ws.send_text(message))
-                        print("FORWARD TO VIEWER:", repr(message))
                 except Exception:
                     traceback.print_exc()
             if coros:
-                await asyncio.gather(*coros, return_exceptions=True)
+                results = await asyncio.gather(*coros, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        print("SEND ERROR:")
+                        traceback.print_exception(type(result), result, result.__traceback__)
+                    else:
+                        print("FRAME DELIVERED SUCCESSFULLY")
         else:
             if isinstance(message, (bytes, bytearray)):
                 logger.info("No viewer connected for device %s; dropping host binary frame size=%d bytes", device_id, len(message))
