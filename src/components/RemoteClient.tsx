@@ -9,12 +9,12 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
-  BarChart3,
   Activity,
-  Brain,
   X,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
-import AIAssistant from "./AIAssistant";
+import RemoteCopilot from "./RemoteCopilot";
 import SessionDashboard from "./SessionDashboard";
 import TunnelSettings from "./TunnelSettings";
 import { getApiBase, normalizeServerUrl } from "../utils/api";
@@ -88,7 +88,7 @@ interface PendingInput {
 }
 
 export default function RemoteClient() {
-  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings" | "assistant">("devices");
+  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings">("devices");
 
   // Devices state
   const [devices, setDevices] = useState<Device[]>([]);
@@ -120,7 +120,6 @@ export default function RemoteClient() {
   const [settingsSaved, setSettingsSaved] = useState(false);
 
   // Dashboard state
-  const [showDashboard, setShowDashboard] = useState(true);
   const [dashboardMetrics, setDashboardMetrics] = useState<DashboardMetrics>({
     ping: 0,
     fps: 0,
@@ -135,11 +134,38 @@ export default function RemoteClient() {
   const lastPingSentRef = useRef<number>(0);
   const remoteResolutionRef = useRef({ width: 1920, height: 1080 });
 
+  // AI panel state
+  const [aiPanelCollapsed, setAiPanelCollapsed] = useState(false);
+  const [aiPanelWidth, setAiPanelWidth] = useState(360);
+  const [resizingAiPanel, setResizingAiPanel] = useState(false);
+  const aiResizeStartRef = useRef<{ x: number; width: number } | null>(null);
+
   // Input reliability state
   const pendingInputsRef = useRef<Map<string, PendingInput>>(new Map());
   const inputQueueRef = useRef<Record<string, any>[]>([]);
   const inputRetryIntervalRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!resizingAiPanel || !aiResizeStartRef.current) return;
+      const delta = aiResizeStartRef.current.x - event.clientX;
+      const nextWidth = Math.min(520, Math.max(320, aiResizeStartRef.current.width + delta));
+      setAiPanelWidth(nextWidth);
+    };
+
+    const handleMouseUp = () => {
+      setResizingAiPanel(false);
+      aiResizeStartRef.current = null;
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [resizingAiPanel]);
 
   const activeServerUrl = useMemo(() => {
     if (tunnelEnabled && tunnelUrl.trim()) {
@@ -156,8 +182,14 @@ export default function RemoteClient() {
     return headers;
   }, [tunnelEnabled, tunnelToken]);
 
-  const getWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/viewer/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
-  const getControlWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/control/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
+  const getWebSocketUrl = (deviceId: string, sessionToken?: string) => {
+    const authToken = tunnelEnabled && tunnelToken.trim() ? tunnelToken.trim() : sessionToken;
+    return buildWebSocketUrl(activeServerUrl, `/ws/viewer/${encodeURIComponent(deviceId)}`, authToken);
+  };
+  const getControlWebSocketUrl = (deviceId: string, sessionToken?: string) => {
+    const authToken = tunnelEnabled && tunnelToken.trim() ? tunnelToken.trim() : sessionToken;
+    return buildWebSocketUrl(activeServerUrl, `/ws/control/${encodeURIComponent(deviceId)}`, authToken);
+  };
   const getHostWebSocketUrl = (deviceId: string) => buildWebSocketUrl(activeServerUrl, `/ws/host/${encodeURIComponent(deviceId)}`, tunnelEnabled ? tunnelToken.trim() : undefined);
 
   const persistSettings = () => {
@@ -260,7 +292,7 @@ export default function RemoteClient() {
         wsRef.current.send("heartbeat");
       }
       if (controlWsRef.current?.readyState === WebSocket.OPEN) {
-        controlWsRef.current.send("heartbeat");
+        controlWsRef.current.send(JSON.stringify({ type: "heartbeat", payload: {} }));
         sendControlPacket("ping_check", {});
       }
 
@@ -326,7 +358,8 @@ export default function RemoteClient() {
 
     if (controlWsRef.current?.readyState === WebSocket.OPEN) {
       try {
-        controlWsRef.current.send(JSON.stringify(packet));
+        const payload = JSON.stringify(packet);
+        controlWsRef.current.send(payload);
         pendingInputsRef.current.set(message_id, {
           packet,
           attempts: 1,
@@ -344,11 +377,14 @@ export default function RemoteClient() {
     pendingInputsRef.current.delete(messageId);
   };
 
-  const connectControlSocket = (deviceId: string) => {
+  const connectControlSocket = (deviceId: string, sessionToken?: string) => {
     if (!deviceId) return;
     if (controlWsRef.current && controlWsRef.current.readyState === WebSocket.OPEN) return;
-
-    const url = getControlWebSocketUrl(deviceId);
+    const url = getControlWebSocketUrl(deviceId, sessionToken);
+    console.log("Opening Control WS:", {
+      url,
+      authMode: tunnelEnabled && tunnelToken.trim() ? "tunnel-token" : sessionToken ? "session-token" : "none",
+    });
     const controlSocket = new WebSocket(url);
     controlSocket.onopen = () => {
       setWebsocketState("control_ready");
@@ -374,9 +410,11 @@ export default function RemoteClient() {
     controlSocket.onerror = () => {
       setWebsocketState("control_error");
       setViewerStatus("reconnecting");
+      console.error("Control WS error");
     };
 
-    controlSocket.onclose = () => {
+    controlSocket.onclose = (event) => {
+      console.error("Control WS closed:", event.code, event.reason || "No reason provided");
       setViewerStatus("disconnected");
       setTimeout(() => connectControlSocket(deviceId), 2000);
     };
@@ -436,6 +474,8 @@ export default function RemoteClient() {
     }
     stopHeartbeatAndRetries();
     setConnectionStatus({ connected: false });
+    setIsConnecting(false);
+    setConnectionError("");
     setSelectedDevice(null);
     setWebsocketState("disconnected");
     setHostStatus("offline");
@@ -445,6 +485,16 @@ export default function RemoteClient() {
   };
 
   const handleConnect = async (device: Device) => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (controlWsRef.current) {
+      controlWsRef.current.close();
+      controlWsRef.current = null;
+    }
+    stopHeartbeatAndRetries();
+
     setSelectedDevice(device);
     setIsConnecting(true);
     setConnectionError("");
@@ -467,8 +517,25 @@ export default function RemoteClient() {
         throw new Error(errorData?.detail || "Connection failed");
       }
 
-      const wsUrl = getWebSocketUrl(device.id);
-      const socket = new WebSocket(wsUrl);
+      const sessionData = await response.json().catch(() => ({}));
+      const sessionToken = typeof sessionData?.session_token === "string" ? sessionData.session_token : undefined;
+      console.log("Session Response:", { sessionToken, deviceId: device.id, sessionData });
+
+      setActiveTab("remote");
+      setConnectionStatus({ connected: false, device: device.name });
+      setWebsocketState("connecting");
+
+      const wsUrl = getWebSocketUrl(device.id, sessionToken);
+      console.log("Opening Screen WS:", {
+        url: wsUrl,
+        authMode: tunnelEnabled && tunnelToken.trim() ? "tunnel-token" : sessionToken ? "session-token" : "none",
+      });
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(wsUrl);
+      } catch (err) {
+        throw new Error(`WebSocket failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
       socket.binaryType = "arraybuffer";
       wsRef.current = socket;
 
@@ -481,7 +548,7 @@ export default function RemoteClient() {
         setViewerStatus("connected");
         sessionStartTimeRef.current = Date.now();
         startHeartbeatAndRetries();
-        connectControlSocket(device.id);
+        connectControlSocket(device.id, sessionToken);
       };
 
       socket.onmessage = async (event) => {
@@ -489,9 +556,15 @@ export default function RemoteClient() {
         const ctx = videoRef.current.getContext("2d");
         if (!ctx) return;
 
-        if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+        if (event.data instanceof ArrayBuffer || event.data instanceof Blob || ArrayBuffer.isView(event.data)) {
           try {
-            const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
+            const blobSource =
+              event.data instanceof Blob
+                ? event.data
+                : event.data instanceof ArrayBuffer
+                  ? event.data
+                  : new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength);
+            const blob = new Blob([blobSource], { type: "image/jpeg" });
             const bitmap = await createImageBitmap(blob);
             remoteResolutionRef.current = { width: bitmap.width, height: bitmap.height };
             setRemoteResolution({ width: bitmap.width, height: bitmap.height });
@@ -544,13 +617,21 @@ export default function RemoteClient() {
       socket.onerror = () => {
         setConnectionError("WebSocket connection error");
         setWebsocketState("error");
+        setIsConnecting(false);
+        console.error("Screen WS error");
+        closeRemoteSession();
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
+        console.error("Screen WS closed:", event.code, event.reason || "No reason provided");
+        if (!connectionStatus.connected) {
+          setConnectionError("WebSocket closed before the remote session could start.");
+        }
         closeRemoteSession();
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Connection failed";
+      console.error("Connection error:", errorMsg, err);
       setConnectionError(errorMsg);
       setIsConnecting(false);
     }
@@ -743,17 +824,6 @@ export default function RemoteClient() {
             Remote
           </button>
           <button
-            onClick={() => setActiveTab("assistant")}
-            className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
-              activeTab === "assistant"
-                ? "bg-blue-600 text-white"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
-            }`}
-          >
-            <Brain className="w-4 h-4" />
-            AI Assistant
-          </button>
-          <button
             onClick={() => setActiveTab("settings")}
             className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
               activeTab === "settings"
@@ -811,24 +881,6 @@ export default function RemoteClient() {
               <span className="text-slate-400">Ready for connection</span>
             )}
           </div>
-          {connectionStatus.connected && activeTab === "remote" && (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowDashboard(!showDashboard)}
-                className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
-                title="Toggle Dashboard"
-              >
-                <BarChart3 className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setActiveTab("assistant")}
-                className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
-                title="AI Assistant"
-              >
-                <Brain className="w-4 h-4" />
-              </button>
-            </div>
-          )}
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 flex gap-6">
@@ -843,52 +895,61 @@ export default function RemoteClient() {
                 <div className="flex items-center justify-center py-12">
                   <Loader className="w-6 h-6 text-blue-500 animate-spin" />
                 </div>
-              ) : devices.length === 0 ? (
-                <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-8 text-center">
-                  <Monitor className="w-12 h-12 text-slate-600 mx-auto mb-3" />
-                  <p className="text-slate-400">No devices available</p>
-                </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {devices.map((device) => (
-                    <div key={device.id} className="bg-[#1E293B] border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition">
-                      <div className="flex items-start justify-between mb-3">
-                        <div>
-                          <h3 className="font-semibold text-white">{device.name}</h3>
-                          <p className="text-xs text-slate-400 font-mono">{device.id}</p>
-                        </div>
-                        <div className={`w-2 h-2 rounded-full ${device.status === "online" ? "bg-emerald-500" : device.status === "in-session" ? "bg-blue-500" : "bg-slate-500"}`} />
-                      </div>
-                      <button
-                        onClick={() => handleConnect(device)}
-                        disabled={device.status === "offline" || isConnecting}
-                        className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition flex items-center justify-center gap-2"
-                      >
-                        {isConnecting ? (
-                          <>
-                            <Loader className="w-3 h-3 animate-spin" />
-                            Connecting...
-                          </>
-                        ) : (
-                          <>
-                            <Wifi className="w-3 h-3" />
-                            Connect
-                          </>
-                        )}
-                      </button>
+                <>
+                  {connectionError && !connectionStatus.connected && (
+                    <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-4 py-3 rounded-lg text-sm mb-4">
+                      {connectionError}
                     </div>
-                  ))}
-                </div>
-              )}
+                  )}
+                  {devices.length === 0 ? (
+                    <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-8 text-center">
+                      <Monitor className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+                      <p className="text-slate-400">No devices available</p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {devices.map((device) => (
+                        <div key={device.id} className="bg-[#1E293B] border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition">
+                          <div className="flex items-start justify-between mb-3">
+                            <div>
+                              <h3 className="font-semibold text-white">{device.name}</h3>
+                              <p className="text-xs text-slate-400 font-mono">{device.id}</p>
+                            </div>
+                            <div className={`w-2 h-2 rounded-full ${device.status === "online" ? "bg-emerald-500" : device.status === "in-session" ? "bg-blue-500" : "bg-slate-500"}`} />
+                          </div>
+                          <button
+                            onClick={() => handleConnect(device)}
+                            disabled={device.status === "offline" || isConnecting}
+                            className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition flex items-center justify-center gap-2"
+                          >
+                            {isConnecting ? (
+                              <>
+                                <Loader className="w-3 h-3 animate-spin" />
+                                Connecting...
+                              </>
+                            ) : (
+                              <>
+                                <Wifi className="w-3 h-3" />
+                                Connect
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
-              <div className="flex gap-2">
-                <button
-                  onClick={fetchDevices}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition"
-                >
-                  Refresh Devices
-                </button>
-              </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={fetchDevices}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition"
+                    >
+                      Refresh Devices
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -952,31 +1013,31 @@ export default function RemoteClient() {
                 <span>Session: {dashboardMetrics.sessionDuration}s</span>
               </div>
 
-              <div className="flex gap-6 flex-1">
-                <div
-                  ref={canvasContainerRef}
-                  className="bg-slate-950 border-2 border-slate-800 rounded-lg overflow-auto shadow-xl flex-1 flex items-center justify-center"
-                >
-                  <canvas
-                    ref={videoRef}
-                    onMouseDown={handleMouseDown}
-                    onMouseMove={handleMouseMove}
-                    onContextMenu={handleCanvasContextMenu}
-                    onWheel={handleWheel}
-                    width={remoteResolution.width}
-                    height={remoteResolution.height}
-                    className="cursor-crosshair bg-black block"
-                    style={{
-                      width: `${remoteResolution.width * zoom}px`,
-                      height: `${remoteResolution.height * zoom}px`,
-                      maxWidth: "100%",
-                      maxHeight: "100%",
-                    }}
-                  />
-                </div>
+              <div className="flex min-h-0 flex-1 gap-4">
+                <div className="flex min-h-0 flex-[0_0_75%] flex-col gap-4">
+                  <div
+                    ref={canvasContainerRef}
+                    className="flex flex-1 items-center justify-center overflow-auto rounded-lg border-2 border-slate-800 bg-slate-950 shadow-xl"
+                  >
+                    <canvas
+                      ref={videoRef}
+                      onMouseDown={handleMouseDown}
+                      onMouseMove={handleMouseMove}
+                      onContextMenu={handleCanvasContextMenu}
+                      onWheel={handleWheel}
+                      width={remoteResolution.width}
+                      height={remoteResolution.height}
+                      className="block cursor-crosshair bg-black"
+                      style={{
+                        width: `${remoteResolution.width * zoom}px`,
+                        height: `${remoteResolution.height * zoom}px`,
+                        maxWidth: "100%",
+                        maxHeight: "100%",
+                      }}
+                    />
+                  </div>
 
-                <div className="w-80 space-y-4 overflow-y-auto">
-                  {showDashboard && (
+                  <div className="overflow-y-auto">
                     <SessionDashboard
                       connection={sessionMetrics.connection}
                       websocketState={websocketState}
@@ -990,8 +1051,24 @@ export default function RemoteClient() {
                       resolution={sessionMetrics.resolution}
                       onReconnect={handleReconnect}
                     />
-                  )}
+                  </div>
                 </div>
+
+                {connectionStatus.connected && (
+                  <div className="flex min-h-0 flex-[0_0_25%] min-w-[320px] max-w-[420px] flex-col">
+                    <RemoteCopilot
+                      apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
+                      isConnected={connectionStatus.connected}
+                      sessionId={selectedDevice?.id ?? "remote-session"}
+                      connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
+                      latency={dashboardMetrics.ping}
+                      fps={dashboardMetrics.fps}
+                      websocketState={websocketState}
+                      hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
+                      viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
+                    />
+                  </div>
+                )}
               </div>
 
               {connectionError && (
@@ -1006,20 +1083,6 @@ export default function RemoteClient() {
                   </button>
                 </div>
               )}
-            </div>
-          )}
-
-          {activeTab === "assistant" && (
-            <div className="w-full max-w-4xl">
-              <AIAssistant
-                apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
-                connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
-                latency={dashboardMetrics.ping}
-                fps={dashboardMetrics.fps}
-                websocketState={websocketState}
-                hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
-                viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
-              />
             </div>
           )}
 

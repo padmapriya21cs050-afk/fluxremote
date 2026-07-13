@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUp, Loader, Sparkles, Trash2 } from "lucide-react";
 
 interface AIAssistantProps {
   apiBaseUrl: string;
@@ -8,49 +9,29 @@ interface AIAssistantProps {
   websocketState: string;
   hostResolution: string;
   viewerResolution: string;
+  isConnected?: boolean;
+  compact?: boolean;
 }
 
-const COMMON_ISSUES = [
-  {
-    label: "Connection slow",
-    type: "slow_connection",
-    prompt: "Why is my connection slow?",
-  },
-  {
-    label: "Host offline",
-    type: "host_offline",
-    prompt: "Why is the host offline?",
-  },
-  {
-    label: "Black screen",
-    type: "black_screen",
-    prompt: "Viewer connected but black screen.",
-  },
-  {
-    label: "Mouse delay",
-    type: "mouse_delay",
-    prompt: "Why is mouse delayed?",
-  },
-  {
-    label: "Keyboard delay",
-    type: "keyboard_delay",
-    prompt: "Keyboard not working or delayed.",
-  },
-  {
-    label: "WebSocket errors",
-    type: "websocket_error",
-    prompt: "Explain websocket errors and how to fix them.",
-  },
-  {
-    label: "Render issues",
-    type: "render_issues",
-    prompt: "Explain Render deployment issues.",
-  },
-  {
-    label: "Vercel issues",
-    type: "vercel_issues",
-    prompt: "Explain Vercel deployment issues.",
-  },
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+}
+
+const createId = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `chat-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+};
+
+const QUICK_PROMPTS = [
+  { label: "Explain this error", prompt: "Explain this error in plain English and suggest fixes." },
+  { label: "Why isn't my device connecting?", prompt: "Why might my remote device not be connecting right now?" },
+  { label: "Help me code", prompt: "Help me debug or write code for the task I am working on." },
+  { label: "Windows troubleshooting", prompt: "Help me troubleshoot a Windows issue step by step." },
+  { label: "Networking help", prompt: "Help me diagnose a networking issue and suggest practical steps." },
 ];
 
 export default function AIAssistant({
@@ -61,145 +42,192 @@ export default function AIAssistant({
   websocketState,
   hostResolution,
   viewerResolution,
+  isConnected = true,
+  compact = false,
 }: AIAssistantProps) {
-  const [selectedIssue, setSelectedIssue] = useState(COMMON_ISSUES[0]);
-  const [customQuestion, setCustomQuestion] = useState("");
-  const [response, setResponse] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const buildPayload = (issueType: string, question: string) => ({
-    type: issueType,
-    context: question,
-    metrics: {
-      connection_status: connectionStatus,
-      latency_ms: latency,
-      fps,
-      websocket_state: websocketState,
-      host_resolution: hostResolution,
-      viewer_resolution: viewerResolution,
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: createId(),
+      role: "assistant",
+      content:
+        "Hello! I’m your FluxRemote AI Copilot. I can help with coding, Windows and Linux troubleshooting, networking, AI questions, writing, math, and remote desktop issues.",
     },
-  });
+  ]);
+  const [draft, setDraft] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-  const requestExplanation = async (issueType: string, prompt: string) => {
-    setLoading(true);
+  const sessionSummary = useMemo(
+    () => ({
+      connectionStatus,
+      latency,
+      fps,
+      websocketState,
+      hostResolution,
+      viewerResolution,
+    }),
+    [connectionStatus, latency, fps, websocketState, hostResolution, viewerResolution]
+  );
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    }
+  }, [messages, isLoading]);
+
+  const clearChat = () => {
+    setMessages([
+      {
+        id: createId(),
+        role: "assistant",
+        content:
+          "The conversation has been cleared. Ask me anything about FluxRemote, debugging, coding, or general help.",
+      },
+    ]);
     setError("");
-    setResponse("");
+  };
+
+  const sendMessage = async (messageText?: string) => {
+    const trimmed = (messageText ?? draft).trim();
+    if (!trimmed || isLoading || !isConnected) {
+      return;
+    }
+
+    const userMessage: ChatMessage = { id: createId(), role: "user", content: trimmed };
+    const nextMessages = [...messages, userMessage];
+    setMessages(nextMessages);
+    setDraft("");
+    setError("");
+    setIsLoading(true);
 
     try {
-      const result = await fetch(`${apiBaseUrl}/api/ai/explain`, {
+      const result = await fetch(`${apiBaseUrl}/api/ai/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload(issueType, prompt)),
+        body: JSON.stringify({
+          message: trimmed,
+          history: nextMessages.map(({ role, content }) => ({ role, content })),
+          session_id: `fluxremote-${connectionStatus}`,
+          context: sessionSummary,
+        }),
       });
 
       if (!result.ok) {
         const body = await result.text();
-        throw new Error(`AI service error: ${body}`);
+        throw new Error(body || "AI service was unavailable.");
       }
 
       const json = await result.json();
-      setResponse(json.answer || json.explanation || "No explanation returned.");
+      const reply = json.reply || json.message || "I’m here and ready to help. Try again in a moment.";
+      setMessages([...nextMessages, { id: createId(), role: "assistant", content: reply }]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to contact AI service.");
+      const fallbackMessage =
+        "Gemini is currently unavailable, but I’m still ready to help. Please try again in a moment or ask a simpler question.";
+      setMessages([...nextMessages, { id: createId(), role: "assistant", content: fallbackMessage }]);
+      setError(err instanceof Error ? err.message : fallbackMessage);
     } finally {
-      setLoading(false);
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendMessage();
     }
   };
 
   return (
-    <div className="space-y-6 w-full max-w-4xl">
-      <div className="bg-[#1E293B] border border-slate-800 rounded-lg p-6">
-        <div className="flex items-center justify-between gap-4">
+    <div className={`flex h-full flex-col ${compact ? "bg-slate-950/90" : "bg-[#111827]"}`}>
+      <div className={`border-b border-slate-800/90 px-4 py-3 ${compact ? "bg-slate-900/80" : "bg-slate-900/70"}`}>
+        <div className="flex items-center justify-between gap-2">
           <div>
-            <h2 className="text-xl font-bold text-white">AI Assistant</h2>
-            <p className="text-sm text-slate-400">
-              Practical troubleshooting guidance for remote sessions.
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-5 grid gap-3 sm:grid-cols-2">
-          <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs text-slate-300">
-            <div className="font-semibold text-slate-100 mb-2">Live session state</div>
-            <div className="space-y-2">
-              <div>Connection: {connectionStatus}</div>
-              <div>Latency: {latency} ms</div>
-              <div>FPS: {fps}</div>
-              <div>WebSocket: {websocketState}</div>
-              <div>Host: {hostResolution}</div>
-              <div>Viewer: {viewerResolution}</div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-white">
+              <Sparkles className="h-4 w-4 text-cyan-400" />
+              FluxRemote AI Copilot
             </div>
-          </div>
-          <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs text-slate-300">
-            <div className="font-semibold text-slate-100 mb-2">How to use</div>
-            <p className="leading-relaxed">
-              Select a common issue or type a custom question about your remote session.
-              The AI will explain the cause and recommend fixes.
+            <p className="text-xs text-slate-400">
+              {isConnected ? "Ready to help with your remote session" : "Connect to a device to unlock the assistant"}
             </p>
           </div>
+          <button
+            onClick={clearChat}
+            className="rounded-lg border border-slate-700 bg-slate-900/70 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:border-slate-500 hover:text-white"
+            title="Clear chat"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-hidden">
+        <div className="flex flex-wrap gap-2 px-3 py-3">
+          {QUICK_PROMPTS.map((suggestion) => (
+            <button
+              key={suggestion.label}
+              onClick={() => void sendMessage(suggestion.prompt)}
+              className="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 transition hover:border-cyan-400 hover:bg-cyan-500/20"
+            >
+              {suggestion.label}
+            </button>
+          ))}
         </div>
 
-        <div className="mt-5 space-y-3">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            {COMMON_ISSUES.map((item) => (
-              <button
-                key={item.type}
-                onClick={() => {
-                  setSelectedIssue(item);
-                  requestExplanation(item.type, item.prompt);
-                }}
-                className={`rounded-lg border px-3 py-2 text-left text-xs text-slate-200 transition ${
-                  item.type === selectedIssue.type
-                    ? "border-blue-500 bg-blue-600/10"
-                    : "border-slate-800 hover:border-slate-600 hover:bg-slate-800"
+        <div ref={scrollRef} className="h-[calc(100%-180px)] space-y-3 overflow-y-auto px-3 pb-3">
+          {messages.map((message) => (
+            <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div
+                className={`max-w-[90%] rounded-2xl px-3 py-2.5 text-sm leading-relaxed shadow-sm ${
+                  message.role === "user"
+                    ? "bg-cyan-500 text-white"
+                    : "border border-slate-800 bg-slate-900/95 text-slate-200"
                 }`}
               >
-                {item.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-slate-300">Custom question</label>
-            <textarea
-              value={customQuestion}
-              onChange={(event) => setCustomQuestion(event.target.value)}
-              rows={4}
-              placeholder="Ask a technical question about your remote session..."
-              className="w-full resize-none bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-sm text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
-
-          <div className="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
-            <button
-              onClick={() =>
-                requestExplanation(
-                  selectedIssue.type,
-                  customQuestion.trim() || selectedIssue.prompt
-                )
-              }
-              disabled={loading}
-              className="inline-flex items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
-            >
-              {loading ? "Analyzing..." : "Ask Gemini"}
-            </button>
-            <div className="text-xs text-slate-500">
-              Gemini answers are based on your session status and runtime metrics.
+                {message.content}
+              </div>
             </div>
-          </div>
-        </div>
+          ))}
 
-        <div className="mt-4 bg-slate-950 border border-slate-800 rounded-lg p-4 min-h-[140px] text-sm text-slate-200">
-          {loading ? (
-            <div className="text-slate-400">Waiting for Gemini response...</div>
-          ) : error ? (
-            <div className="text-rose-400">{error}</div>
-          ) : response ? (
-            <div className="whitespace-pre-wrap">{response}</div>
-          ) : (
-            <div className="text-slate-500">Response will appear here after asking the assistant.</div>
+          {isLoading && (
+            <div className="flex justify-start">
+              <div className="rounded-2xl border border-slate-800 bg-slate-900/95 px-3 py-2.5 text-sm text-slate-300">
+                <div className="flex items-center gap-2">
+                  <Loader className="h-4 w-4 animate-spin text-cyan-400" />
+                  Thinking...
+                </div>
+              </div>
+            </div>
           )}
+
+          {error && !isLoading && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+              {error}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="border-t border-slate-800/90 bg-slate-900/70 px-3 py-3">
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={handleKeyDown}
+          rows={2}
+          placeholder={isConnected ? "Ask anything about FluxRemote, coding, troubleshooting, or general knowledge..." : "Connect to a device first"}
+          className="w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/90 px-3 py-2 text-sm text-white outline-none ring-0 placeholder:text-slate-500 focus:border-cyan-500"
+          disabled={!isConnected}
+        />
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <p className="text-[11px] text-slate-500">Press Enter to send · Shift+Enter for a new line</p>
+          <button
+            onClick={() => void sendMessage()}
+            disabled={!draft.trim() || isLoading || !isConnected}
+            className="inline-flex items-center gap-2 rounded-full bg-cyan-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:bg-slate-700"
+          >
+            {isLoading ? <Loader className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
+            Send
+          </button>
         </div>
       </div>
     </div>
