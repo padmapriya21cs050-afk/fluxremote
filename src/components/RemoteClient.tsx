@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 import RemoteCopilot from "./RemoteCopilot";
 import AIAssistant from "./AIAssistant";
-import SessionDashboard from "./SessionDashboard";
 import TunnelSettings from "./TunnelSettings";
 import { getApiBase, normalizeServerUrl } from "../utils/api";
 
@@ -855,14 +854,10 @@ export default function RemoteClient() {
             <div className={`w-2 h-2 rounded-full ${connectionStatus.connected ? "bg-emerald-500 animate-pulse" : "bg-slate-600"}`} />
             {connectionStatus.connected ? (
               <>
-                <span className="text-slate-400">
-                  Connected to: <b className="text-white">{connectionStatus.device}</b>
-                </span>
-                {dashboardMetrics.ping > 0 && (
-                  <span className="text-slate-400">
-                    Ping: <b className="text-blue-400">{dashboardMetrics.ping}ms</b>
-                  </span>
-                )}
+                <span className="text-slate-400">Connected</span>
+                <span className="text-white font-semibold">{connectionStatus.device}</span>
+                <span className="text-slate-400">Session</span>
+                <span className="text-blue-400">{dashboardMetrics.sessionDuration}s</span>
               </>
             ) : (
               <span className="text-slate-400">Ready for connection</span>
@@ -941,8 +936,8 @@ export default function RemoteClient() {
           )}
 
           {activeTab === "remote" && (
-            <div className="space-y-4 flex-1 flex flex-col">
-              <div className="flex items-center justify-between">
+            <div className="flex-1 flex flex-col min-h-0">
+              <div className="flex items-center justify-between mb-4">
                 <div>
                   <h2 className="text-xl font-bold text-white">{selectedDevice?.name}</h2>
                   <p className="text-sm text-slate-400">Remote desktop viewer</p>
@@ -992,52 +987,40 @@ export default function RemoteClient() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 text-xs text-slate-400">
-                <span>Zoom: {Math.round(zoom * 100)}%</span>
-                <span>|</span>
-                <span>Resolution: {remoteResolution.width}x{remoteResolution.height}</span>
-                <span>|</span>
-                <span>Session: {dashboardMetrics.sessionDuration}s</span>
+              <div className="mb-4 flex items-center gap-2 text-xs text-slate-400">
+                <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-emerald-300">Connected</span>
+                <span className="text-slate-300">{selectedDevice?.name ?? connectionStatus.device}</span>
+                <span className="text-slate-500">•</span>
+                <span>Session {dashboardMetrics.sessionDuration}s</span>
               </div>
 
-              <div className="flex min-h-0 flex-1 flex-col gap-4">
-                <div
-                  ref={canvasContainerRef}
-                  className="flex flex-1 items-center justify-center overflow-auto rounded-lg border-2 border-slate-800 bg-slate-950 shadow-xl"
-                >
-                  <canvas
-                    ref={videoRef}
-                    onMouseDown={handleMouseDown}
-                    onMouseMove={handleMouseMove}
-                    onContextMenu={handleCanvasContextMenu}
-                    onWheel={handleWheel}
-                    width={remoteResolution.width}
-                    height={remoteResolution.height}
-                    className="block cursor-crosshair bg-black"
-                    style={{
-                      width: `${remoteResolution.width * zoom}px`,
-                      height: `${remoteResolution.height * zoom}px`,
-                      maxWidth: "100%",
-                      maxHeight: "100%",
-                    }}
-                  />
+              <div className="flex flex-1 min-h-0 gap-4">
+                <div className="flex-[4] min-w-0">
+                  <div
+                    ref={canvasContainerRef}
+                    className="flex h-full min-h-[480px] items-center justify-center overflow-auto rounded-2xl border border-slate-800 bg-slate-950 shadow-xl"
+                  >
+                    <canvas
+                      ref={videoRef}
+                      onMouseDown={handleMouseDown}
+                      onMouseMove={handleMouseMove}
+                      onContextMenu={handleCanvasContextMenu}
+                      onWheel={handleWheel}
+                      width={remoteResolution.width}
+                      height={remoteResolution.height}
+                      className="block cursor-crosshair bg-black"
+                      style={{
+                        width: `${remoteResolution.width * zoom}px`,
+                        height: `${remoteResolution.height * zoom}px`,
+                        maxWidth: "100%",
+                        maxHeight: "100%",
+                      }}
+                    />
+                  </div>
                 </div>
 
                 {connectionStatus.connected && (
-                  <div className="space-y-4">
-                    <SessionDashboard
-                      connection={sessionMetrics.connection}
-                      websocketState={websocketState}
-                      hostStatus={hostStatus}
-                      viewerStatus={viewerStatus}
-                      ping={dashboardMetrics.ping}
-                      fps={dashboardMetrics.fps}
-                      bandwidth={dashboardMetrics.bandwidth}
-                      cpu={dashboardMetrics.hostCpu}
-                      memory={dashboardMetrics.hostMemory}
-                      resolution={sessionMetrics.resolution}
-                      onReconnect={handleReconnect}
-                    />
+                  <div className="flex-[1] min-w-[320px] max-w-[360px]">
                     <RemoteCopilot
                       apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
                       isConnected={connectionStatus.connected}
@@ -1048,13 +1031,20 @@ export default function RemoteClient() {
                       websocketState={websocketState}
                       hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
                       viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
+                      compact
+                      className="h-full"
+                      quickPrompts={[
+                        { label: "Help me", prompt: "Help me troubleshoot this FluxRemote issue." },
+                        { label: "Input issue", prompt: "Help me fix keyboard and mouse issues in FluxRemote." },
+                        { label: "Performance", prompt: "Help me improve connection quality and reduce lag in FluxRemote." },
+                      ]}
                     />
                   </div>
                 )}
               </div>
 
               {connectionError && (
-                <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
+                <div className="mt-4 bg-rose-500/10 border border-rose-500/30 text-rose-400 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
                   <AlertCircle className="w-4 h-4" />
                   <div className="flex-1">{connectionError}</div>
                   <button
