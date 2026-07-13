@@ -9,12 +9,10 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
-  Activity,
-  X,
-  PanelLeftClose,
-  PanelLeftOpen,
+  Sparkles,
 } from "lucide-react";
 import RemoteCopilot from "./RemoteCopilot";
+import AIAssistant from "./AIAssistant";
 import SessionDashboard from "./SessionDashboard";
 import TunnelSettings from "./TunnelSettings";
 import { getApiBase, normalizeServerUrl } from "../utils/api";
@@ -88,7 +86,7 @@ interface PendingInput {
 }
 
 export default function RemoteClient() {
-  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings">("devices");
+  const [activeTab, setActiveTab] = useState<"devices" | "remote" | "settings" | "assistant">("devices");
 
   // Devices state
   const [devices, setDevices] = useState<Device[]>([]);
@@ -134,38 +132,11 @@ export default function RemoteClient() {
   const lastPingSentRef = useRef<number>(0);
   const remoteResolutionRef = useRef({ width: 1920, height: 1080 });
 
-  // AI panel state
-  const [aiPanelCollapsed, setAiPanelCollapsed] = useState(false);
-  const [aiPanelWidth, setAiPanelWidth] = useState(360);
-  const [resizingAiPanel, setResizingAiPanel] = useState(false);
-  const aiResizeStartRef = useRef<{ x: number; width: number } | null>(null);
-
   // Input reliability state
   const pendingInputsRef = useRef<Map<string, PendingInput>>(new Map());
   const inputQueueRef = useRef<Record<string, any>[]>([]);
   const inputRetryIntervalRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    const handleMouseMove = (event: MouseEvent) => {
-      if (!resizingAiPanel || !aiResizeStartRef.current) return;
-      const delta = aiResizeStartRef.current.x - event.clientX;
-      const nextWidth = Math.min(520, Math.max(320, aiResizeStartRef.current.width + delta));
-      setAiPanelWidth(nextWidth);
-    };
-
-    const handleMouseUp = () => {
-      setResizingAiPanel(false);
-      aiResizeStartRef.current = null;
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [resizingAiPanel]);
 
   const activeServerUrl = useMemo(() => {
     if (tunnelEnabled && tunnelUrl.trim()) {
@@ -563,8 +534,8 @@ export default function RemoteClient() {
                 ? event.data
                 : event.data instanceof ArrayBuffer
                   ? event.data
-                  : new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength);
-            const blob = new Blob([blobSource], { type: "image/jpeg" });
+                  : new Uint8Array(event.data.buffer as ArrayBuffer, event.data.byteOffset, event.data.byteLength);
+            const blob = new Blob([blobSource as BlobPart], { type: "image/jpeg" });
             const bitmap = await createImageBitmap(blob);
             remoteResolutionRef.current = { width: bitmap.width, height: bitmap.height };
             setRemoteResolution({ width: bitmap.width, height: bitmap.height });
@@ -709,6 +680,11 @@ export default function RemoteClient() {
   };
 
   const handleKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("input, textarea, [contenteditable='true']")) {
+      return;
+    }
+
     if (!selectedDevice || !connectionStatus.connected) return;
     const key = event.key;
     if (key.length === 1 || key === "Enter" || key === "Escape" || key === "Backspace" || key === "Tab") {
@@ -822,6 +798,17 @@ export default function RemoteClient() {
           >
             <Wifi className="w-4 h-4" />
             Remote
+          </button>
+          <button
+            onClick={() => setActiveTab("assistant")}
+            className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
+              activeTab === "assistant"
+                ? "bg-blue-600 text-white"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            AI Assistant
           </button>
           <button
             onClick={() => setActiveTab("settings")}
@@ -1013,49 +1000,44 @@ export default function RemoteClient() {
                 <span>Session: {dashboardMetrics.sessionDuration}s</span>
               </div>
 
-              <div className="flex min-h-0 flex-1 gap-4">
-                <div className="flex min-h-0 flex-[0_0_75%] flex-col gap-4">
-                  <div
-                    ref={canvasContainerRef}
-                    className="flex flex-1 items-center justify-center overflow-auto rounded-lg border-2 border-slate-800 bg-slate-950 shadow-xl"
-                  >
-                    <canvas
-                      ref={videoRef}
-                      onMouseDown={handleMouseDown}
-                      onMouseMove={handleMouseMove}
-                      onContextMenu={handleCanvasContextMenu}
-                      onWheel={handleWheel}
-                      width={remoteResolution.width}
-                      height={remoteResolution.height}
-                      className="block cursor-crosshair bg-black"
-                      style={{
-                        width: `${remoteResolution.width * zoom}px`,
-                        height: `${remoteResolution.height * zoom}px`,
-                        maxWidth: "100%",
-                        maxHeight: "100%",
-                      }}
-                    />
-                  </div>
-
-                  <div className="overflow-y-auto">
-                    <SessionDashboard
-                      connection={sessionMetrics.connection}
-                      websocketState={websocketState}
-                      hostStatus={sessionMetrics.hostStatus}
-                      viewerStatus={sessionMetrics.viewerStatus}
-                      ping={sessionMetrics.ping}
-                      fps={sessionMetrics.fps}
-                      bandwidth={sessionMetrics.bandwidth}
-                      cpu={sessionMetrics.cpu}
-                      memory={sessionMetrics.memory}
-                      resolution={sessionMetrics.resolution}
-                      onReconnect={handleReconnect}
-                    />
-                  </div>
+              <div className="flex min-h-0 flex-1 flex-col gap-4">
+                <div
+                  ref={canvasContainerRef}
+                  className="flex flex-1 items-center justify-center overflow-auto rounded-lg border-2 border-slate-800 bg-slate-950 shadow-xl"
+                >
+                  <canvas
+                    ref={videoRef}
+                    onMouseDown={handleMouseDown}
+                    onMouseMove={handleMouseMove}
+                    onContextMenu={handleCanvasContextMenu}
+                    onWheel={handleWheel}
+                    width={remoteResolution.width}
+                    height={remoteResolution.height}
+                    className="block cursor-crosshair bg-black"
+                    style={{
+                      width: `${remoteResolution.width * zoom}px`,
+                      height: `${remoteResolution.height * zoom}px`,
+                      maxWidth: "100%",
+                      maxHeight: "100%",
+                    }}
+                  />
                 </div>
 
                 {connectionStatus.connected && (
-                  <div className="flex min-h-0 flex-[0_0_25%] min-w-[320px] max-w-[420px] flex-col">
+                  <div className="space-y-4">
+                    <SessionDashboard
+                      connection={sessionMetrics.connection}
+                      websocketState={websocketState}
+                      hostStatus={hostStatus}
+                      viewerStatus={viewerStatus}
+                      ping={dashboardMetrics.ping}
+                      fps={dashboardMetrics.fps}
+                      bandwidth={dashboardMetrics.bandwidth}
+                      cpu={dashboardMetrics.hostCpu}
+                      memory={dashboardMetrics.hostMemory}
+                      resolution={sessionMetrics.resolution}
+                      onReconnect={handleReconnect}
+                    />
                     <RemoteCopilot
                       apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
                       isConnected={connectionStatus.connected}
@@ -1083,6 +1065,28 @@ export default function RemoteClient() {
                   </button>
                 </div>
               )}
+            </div>
+          )}
+
+          {activeTab === "assistant" && (
+            <div className="w-full max-w-4xl">
+              <div className="mb-4">
+                <h2 className="text-xl font-bold text-white mb-1">AI Assistant</h2>
+                <p className="text-sm text-slate-400">FluxRemote help assistant for setup, troubleshooting, and support</p>
+              </div>
+              <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#111827]">
+                <AIAssistant
+                  apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
+                  connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
+                  latency={dashboardMetrics.ping}
+                  fps={dashboardMetrics.fps}
+                  websocketState={websocketState}
+                  hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
+                  viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
+                  isConnected={connectionStatus.connected}
+                  compact={false}
+                />
+              </div>
             </div>
           )}
 
