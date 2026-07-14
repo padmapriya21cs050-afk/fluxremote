@@ -2,7 +2,7 @@ import asyncio
 import json
 import websockets
 
-SERVER = "ws://127.0.0.1:8000"
+SERVER = "ws://127.0.0.1:8001"
 DEVICE_ID = "test-device-123"
 
 async def host_runner():

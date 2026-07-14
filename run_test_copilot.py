@@ -1,6 +1,6 @@
 import requests
 
-url = "http://127.0.0.1:8000/api/copilot/chat"
+url = "http://127.0.0.1:8001/api/copilot/chat"
 payload = {
     "message": "Hello from test",
     "history": [],
