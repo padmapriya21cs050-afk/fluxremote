@@ -284,6 +284,7 @@ def read_root():
 
 @app.post("/api/devices/register")
 def register_device(device: DeviceRegister):
+    logger.info("REGISTER DEVICE endpoint: entering | device_id=%s | device_name=%s", device.device_id, device.device_name)
     # Hashes the password used for connecting to the host
     hash_pwd = auth.hash_password(device.access_password)
     print("=" * 80)
@@ -296,7 +297,9 @@ def register_device(device: DeviceRegister):
                 device.device_id, len(device.access_password) if device.access_password else 0, len(hash_pwd))
     
     success = db.register_device(device.device_id, device.device_name, hash_pwd)
+    logger.info("REGISTER DEVICE endpoint: registration_result=%s | device_id=%s", success, device.device_id)
     if not success:
+        logger.error("REGISTER DEVICE endpoint: database insert/update failed | device_id=%s", device.device_id)
         raise HTTPException(
             status_code=500,
             detail="Failed to register or update device configuration."
@@ -322,6 +325,7 @@ def register_device(device: DeviceRegister):
         print("-" * 80)
         logger.error("REGISTER DEVICE: Device not found after registration | device_id=%s", device.device_id)
     
+    logger.info("REGISTER DEVICE endpoint: success | device_id=%s", device.device_id)
     return {
         "message": "Device registered successfully.",
         "device_id": device.device_id,
@@ -330,7 +334,10 @@ def register_device(device: DeviceRegister):
 
 @app.get("/api/devices/online")
 def list_online_devices():
-    return db.get_online_devices()
+    logger.info("LIST ONLINE DEVICES endpoint: entering")
+    devices = db.get_online_devices()
+    logger.info("LIST ONLINE DEVICES endpoint: returned_count=%d", len(devices))
+    return devices
 
 @app.post("/api/ai/chat", response_model=AIChatResponse)
 def ai_chat(request: AIChatRequest):
@@ -509,17 +516,19 @@ class ConnectionManager:
         self.session_start_times: Dict[str, float] = {}
 
     async def register_host(self, device_id: str, websocket: WebSocket):
+        logger.info("REGISTER_HOST: entering | device_id=%s", device_id)
         await websocket.accept()
         self.hosts[device_id] = websocket
         db.update_device_status(device_id, is_online=True)
-        logger.info(f"Host desktop {device_id} is now ONLINE.")
+        logger.info("REGISTER_HOST: success | device_id=%s | host_count=%d", device_id, len(self.hosts))
         print("Host connected", device_id)
 
     def unregister_host(self, device_id: str):
+        logger.info("UNREGISTER_HOST: entering | device_id=%s", device_id)
         if device_id in self.hosts:
             del self.hosts[device_id]
         db.update_device_status(device_id, is_online=False)
-        logger.info(f"Host desktop {device_id} is now OFFLINE.")
+        logger.info("UNREGISTER_HOST: success | device_id=%s | host_count=%d", device_id, len(self.hosts))
 
     async def register_viewer(self, device_id: str, websocket: WebSocket) -> bool:
         await websocket.accept()
@@ -826,7 +835,9 @@ connection_manager = ConnectionManager()
 
 @app.websocket("/ws/host/{device_id}")
 async def ws_host_endpoint(websocket: WebSocket, device_id: str):
+    logger.info("WS_HOST: entering | device_id=%s", device_id)
     if not await _ensure_ws_authorized(websocket):
+        logger.warning("WS_HOST: authorization failed | device_id=%s", device_id)
         return
 
     await connection_manager.register_host(device_id, websocket)
@@ -845,10 +856,11 @@ async def ws_host_endpoint(websocket: WebSocket, device_id: str):
                 break
 
             if "bytes" in data:
-                logger.info("Host websocket received binary frame from device %s", device_id)
+                logger.info("WS_HOST: binary frame received | device_id=%s | size=%d", device_id, len(data.get("bytes", b"")))
                 await connection_manager.relay_from_host(device_id, data["bytes"])
             elif "text" in data:
                 text_data = data["text"]
+                logger.info("WS_HOST: text frame received | device_id=%s | text=%s", device_id, text_data)
                 if text_data in ("heartbeat", "ping"):
                     db.update_device_status(device_id, is_online=True)
                     if text_data == "ping":

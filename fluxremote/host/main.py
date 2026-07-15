@@ -16,7 +16,7 @@ import ctypes
 import atexit
 import signal
 import traceback
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 from typing import Dict, Any, Optional
 
 # Set up logging before imports so failures can be logged clearly
@@ -273,9 +273,19 @@ class FluxHost:
         separator = "&" if "?" in url else "?"
         return f"{url}{separator}token={quote(self.tunnel_token)}"
 
+    def _to_http_base(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme == "ws":
+            scheme = "http"
+        elif parsed.scheme == "wss":
+            scheme = "https"
+        else:
+            scheme = parsed.scheme
+        return urlunparse(parsed._replace(scheme=scheme))
+
     def register_device(self) -> bool:
         """Registers device metadata on the server before launching socket connection."""
-        register_url = f"{self.server_url}/api/devices/register"
+        logger.info("HOST REGISTER: entering | device_id=%s | server_url=%s", self.device_id, self.server_url)
         payload = {
             "device_id": self.device_id,
             "device_name": self.device_name,
@@ -287,27 +297,30 @@ class FluxHost:
         print(f"access_password={repr(self.access_password)}")
         print("--------------------------------")
         try:
-            # Swap ws:// with http:// or wss:// with https://
-            http_url = self.server_url.replace("ws://", "http://").replace("wss://", "https://")
+            http_url = self._to_http_base(self.server_url)
+            registration_url = f"{http_url}/api/devices/register"
             headers = {}
             if self.tunnel_token:
                 headers["Authorization"] = f"Bearer {self.tunnel_token}"
-            response = requests.post(f"{http_url}/api/devices/register", json=payload, headers=headers, timeout=5)
-            if response.status_code == 200:
-                logger.info("Successfully registered/updated device on signalling server.")
+            logger.info("HOST REGISTER: posting to %s | payload=%s", registration_url, payload)
+            response = requests.post(registration_url, json=payload, headers=headers, timeout=10)
+            logger.info("HOST REGISTER: response | status_code=%s | body=%s", response.status_code, response.text[:500])
+            if response.ok:
+                logger.info("HOST REGISTER: success | device_id=%s", self.device_id)
                 return True
-            else:
-                logger.error(f"Failed to register device: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Error registering device on server: {e}")
+            logger.error("HOST REGISTER: failed | device_id=%s | status_code=%s | body=%s", self.device_id, response.status_code, response.text[:500])
+            return False
+        except Exception as exc:
+            logger.exception("HOST REGISTER: exception | device_id=%s | error=%s", self.device_id, exc)
             return False
 
     def start(self):
         """Starts the host agent and handles auto-reconnections."""
-        if not self.register_device():
-            logger.warning("Continuing starting procedures, but server registration failed. Port may be offline.")
-            
+        logger.info("HOST START: entering | device_id=%s", self.device_id)
+        registration_ok = self.register_device()
+        if not registration_ok:
+            logger.warning("HOST START: registration failed; continuing with websocket startup and retrying registration later | device_id=%s", self.device_id)
+
         self.running = True
         self._init_tray_icon()
         
@@ -805,6 +818,7 @@ if __name__ == "__main__":
     logger.info("       Device ID: %s", args.id)
     logger.info("       Server: %s", args.server)
     logger.info("------------------------------------------")
+    logger.info("HOST ENTRYPOINT: __main__ executed | device_id=%s | server=%s", args.id, args.server)
 
     host = FluxHost(server_url=args.server, device_id=args.id, access_password=args.password, tunnel_token=args.auth_token)
     host.tray_enabled = args.tray
@@ -814,3 +828,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         host.stop()
         sys.exit(0)
+    except Exception as exc:
+        logger.exception("HOST ENTRYPOINT: startup failed | error=%s", exc)
+        sys.exit(1)

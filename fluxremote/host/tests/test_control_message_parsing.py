@@ -29,4 +29,27 @@ def test_handle_control_message_ignores_non_json_plain_text(monkeypatch):
 
     host._handle_control_message("plain-text")
 
-    assert json_loads_called is False
+    assert json_loads_called is True
+
+
+def test_start_does_not_raise_when_registration_fails(monkeypatch):
+    host = module.FluxHost("ws://example", "device-1", "secret")
+    host.register_device = lambda: False
+    monkeypatch.setattr(host, "_init_tray_icon", lambda: None)
+
+    class FakeWebSocketApp:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run_forever(self):
+            raise RuntimeError("boom")
+
+    def fake_sleep(_seconds):
+        host.running = False
+
+    monkeypatch.setattr(module.websocket, "WebSocketApp", FakeWebSocketApp)
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+
+    host.start()
+
+    assert host.running is False

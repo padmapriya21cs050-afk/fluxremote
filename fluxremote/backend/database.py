@@ -9,14 +9,22 @@ DB_PATH = os.environ.get("DATABASE_URL", "fluxremote.db")
 
 logger = logging.getLogger("fluxremote.database")
 
+
 def get_connection():
     """Returns a connection to the SQLite database with row factory enabled."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    logger.info("Opening database connection | path=%s", DB_PATH)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception:
+        logger.exception("Failed to open database connection | path=%s", DB_PATH)
+        raise
+
 
 def init_db():
     """Initializes the database schema and creates necessary tables if they don't exist."""
+    logger.info("Initializing database schema | path=%s", DB_PATH)
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -88,11 +96,12 @@ def init_db():
     
     conn.commit()
     conn.close()
-    logger.info("SQLite Database initialized successfully.")
+    logger.info("SQLite database initialized successfully | path=%s", DB_PATH)
 
 # Database Access Operations
 
 def create_user(username: str, email: str, password_hash: str) -> bool:
+    logger.info("create_user: entering | username=%s", username)
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -102,11 +111,14 @@ def create_user(username: str, email: str, password_hash: str) -> bool:
         )
         conn.commit()
         conn.close()
+        logger.info("create_user: success | username=%s", username)
         return True
     except sqlite3.IntegrityError:
+        logger.warning("create_user: integrity error | username=%s", username)
         return False
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    logger.info("get_user_by_username: entering | username=%s", username)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -115,6 +127,7 @@ def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 def register_device(device_id: str, device_name: str, password_hash: str, owner_username: Optional[str] = None) -> bool:
+    logger.info("register_device: entering | device_id=%s | device_name=%s | owner_username=%s", device_id, device_name, owner_username)
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -145,38 +158,63 @@ def register_device(device_id: str, device_name: str, password_hash: str, owner_
         )
         conn.commit()
         conn.close()
+        logger.info("register_device: success | device_id=%s", device_id)
         return True
     except Exception as e:
-        logger.error(f"Error registering device: {e}")
+        logger.exception("register_device: exception | device_id=%s | error=%s", device_id, e)
         return False
 
-def update_device_status(device_id: str, is_online: bool):
+
+def update_device_status(device_id: str, is_online: bool, device_name: Optional[str] = None, password_hash: Optional[str] = None):
+    logger.info("update_device_status: entering | device_id=%s | is_online=%s", device_id, is_online)
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE devices SET is_online = ?, last_seen = ? WHERE device_id = ?",
-        (1 if is_online else 0, datetime.now(), device_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO devices (device_id, device_name, access_password_hash, owner_id, is_online, last_seen)
+            VALUES (?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                device_name = COALESCE(excluded.device_name, devices.device_name),
+                access_password_hash = COALESCE(excluded.access_password_hash, devices.access_password_hash),
+                is_online = excluded.is_online,
+                last_seen = excluded.last_seen
+            """,
+            (device_id, device_name or device_id, password_hash or "", 1 if is_online else 0, datetime.now())
+        )
+        conn.commit()
+        conn.close()
+        logger.info("update_device_status: success | device_id=%s | is_online=%s", device_id, is_online)
+    except Exception:
+        logger.exception("update_device_status: exception | device_id=%s | is_online=%s", device_id, is_online)
+        raise
+
 
 def get_device(device_id: str) -> Optional[Dict[str, Any]]:
+    logger.info("get_device: entering | device_id=%s", device_id)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM devices WHERE device_id = ?", (device_id,))
     row = cursor.fetchone()
     conn.close()
+    logger.info("get_device: success | device_id=%s | found=%s", device_id, bool(row))
     return dict(row) if row else None
 
+
 def get_online_devices() -> List[Dict[str, Any]]:
+    logger.info("get_online_devices: entering")
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT device_id, device_name, is_online, last_seen FROM devices WHERE is_online = 1")
+    cursor.execute("SELECT device_id, device_name, is_online, last_seen FROM devices WHERE is_online = 1 ORDER BY last_seen DESC")
     rows = cursor.fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    devices = [dict(row) for row in rows]
+    logger.info("get_online_devices: success | count=%d", len(devices))
+    return devices
+
 
 def create_session(session_id: str, device_id: str, viewer_id: str, host_id: str, session_token: str = None, pairing_code: str = None) -> bool:
+    logger.info("create_session: entering | session_id=%s | device_id=%s", session_id, device_id)
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -186,21 +224,26 @@ def create_session(session_id: str, device_id: str, viewer_id: str, host_id: str
         )
         conn.commit()
         conn.close()
+        logger.info("create_session: success | session_id=%s | device_id=%s", session_id, device_id)
         return True
     except Exception as e:
-        logger.error(f"Error creating session record: {e}")
+        logger.exception("create_session: exception | session_id=%s | device_id=%s | error=%s", session_id, device_id, e)
         return False
 
 
 def get_session_by_token(session_token: str) -> Optional[Dict[str, Any]]:
+    logger.info("get_session_by_token: entering | session_token=%s", session_token)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM sessions WHERE session_token = ?", (session_token,))
     row = cursor.fetchone()
     conn.close()
+    logger.info("get_session_by_token: success | session_token=%s | found=%s", session_token, bool(row))
     return dict(row) if row else None
 
+
 def close_session(session_id: str, duration: int = 0, bytes_tx: int = 0):
+    logger.info("close_session: entering | session_id=%s | duration=%d | bytes_tx=%d", session_id, duration, bytes_tx)
     conn = get_connection()
     cursor = conn.cursor()
     # Fetch session info first
