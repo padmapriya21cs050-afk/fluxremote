@@ -12,7 +12,6 @@ import {
   Sparkles,
 } from "lucide-react";
 import RemoteCopilot from "./RemoteCopilot";
-import AIAssistant from "./AIAssistant";
 import TunnelSettings from "./TunnelSettings";
 import { getApiBase, normalizeServerUrl } from "../utils/api";
 
@@ -760,8 +759,9 @@ export default function RemoteClient() {
   };
 
   return (
-    <div className="flex h-screen w-screen bg-[#0B132B] text-slate-100 overflow-hidden">
-      <div className="w-56 bg-[#1E293B] border-r border-slate-800 flex flex-col shrink-0">
+    <>
+      <div className="flex h-screen w-screen bg-[#0B132B] text-slate-100 overflow-hidden">
+        <div className="w-56 bg-[#1E293B] border-r border-slate-800 flex flex-col shrink-0">
         <div className="p-4 flex items-center gap-3 border-b border-slate-800">
           <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
             <Monitor className="w-4 h-4 text-white" />
@@ -994,8 +994,8 @@ export default function RemoteClient() {
                 <span>Session {dashboardMetrics.sessionDuration}s</span>
               </div>
 
-              <div className="flex flex-1 min-h-0 gap-4">
-                <div className="flex-[4] min-w-0">
+              <div className="flex flex-1 min-h-0">
+                <div className="flex-1 min-w-0">
                   <div
                     ref={canvasContainerRef}
                     className="flex h-full min-h-[480px] items-center justify-center overflow-auto rounded-2xl border border-slate-800 bg-slate-950 shadow-xl"
@@ -1018,29 +1018,6 @@ export default function RemoteClient() {
                     />
                   </div>
                 </div>
-
-                {connectionStatus.connected && (
-                  <div className="flex-[1] min-w-[320px] max-w-[360px]">
-                    <RemoteCopilot
-                      apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
-                      isConnected={connectionStatus.connected}
-                      sessionId={selectedDevice?.id ?? "remote-session"}
-                      connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
-                      latency={dashboardMetrics.ping}
-                      fps={dashboardMetrics.fps}
-                      websocketState={websocketState}
-                      hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
-                      viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
-                      compact
-                      className="h-full"
-                      quickPrompts={[
-                        { label: "Help me", prompt: "Help me troubleshoot this FluxRemote issue." },
-                        { label: "Input issue", prompt: "Help me fix keyboard and mouse issues in FluxRemote." },
-                        { label: "Performance", prompt: "Help me improve connection quality and reduce lag in FluxRemote." },
-                      ]}
-                    />
-                  </div>
-                )}
               </div>
 
               {connectionError && (
@@ -1061,21 +1038,11 @@ export default function RemoteClient() {
           {activeTab === "assistant" && (
             <div className="w-full max-w-4xl">
               <div className="mb-4">
-                <h2 className="text-xl font-bold text-white mb-1">AI Assistant</h2>
-                <p className="text-sm text-slate-400">FluxRemote help assistant for setup, troubleshooting, and support</p>
+                <h2 className="text-xl font-bold text-white mb-1">Flux AI</h2>
+                <p className="text-sm text-slate-400">Open the floating assistant from the bottom-right corner for help with coding, debugging, writing, systems, and general knowledge.</p>
               </div>
-              <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#111827]">
-                <AIAssistant
-                  apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
-                  connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
-                  latency={dashboardMetrics.ping}
-                  fps={dashboardMetrics.fps}
-                  websocketState={websocketState}
-                  hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
-                  viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
-                  isConnected={connectionStatus.connected}
-                  compact={false}
-                />
+              <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#111827] p-8 text-sm text-slate-300">
+                The assistant now lives as a floating Copilot-style panel that overlays the remote desktop without changing the session layout or streaming behavior.
               </div>
             </div>
           )}
@@ -1186,5 +1153,19 @@ export default function RemoteClient() {
         </div>
       </div>
     </div>
+
+    <RemoteCopilot
+      apiBaseUrl={getApiBase(tunnelEnabled && tunnelUrl.trim() ? tunnelUrl : undefined)}
+      isConnected={connectionStatus.connected}
+      sessionId={selectedDevice?.id ?? "remote-session"}
+      connectionStatus={connectionStatus.connected ? "connected" : "disconnected"}
+      latency={dashboardMetrics.ping}
+      fps={dashboardMetrics.fps}
+      websocketState={websocketState}
+      hostResolution={`${remoteResolution.width}x${remoteResolution.height}`}
+      viewerResolution={`${canvasContainerRef.current?.clientWidth || 0}x${canvasContainerRef.current?.clientHeight || 0}`}
+      compact={false}
+    />
+    </>
   );
 }

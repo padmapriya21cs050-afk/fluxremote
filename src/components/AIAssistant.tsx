@@ -36,20 +36,19 @@ export default function AIAssistant({
       hostResolution={hostResolution}
       viewerResolution={viewerResolution}
       mode="support"
-      title="FluxRemote Help Assistant"
-      subtitle="Get help with setup, connectivity, permissions, input, and troubleshooting."
-      welcomeMessage="Hello! I’m FluxRemote Help Assistant. I can help with device connectivity, host issues, viewer problems, keyboard and mouse input, screen sharing, performance, authentication, file transfer, installation, and Windows permissions."
-      placeholder="Describe the FluxRemote problem you’re seeing…"
+      title="Flux AI"
+      subtitle="Ask anything"
+      welcomeMessage="Hello! I can help with device connectivity, troubleshooting, coding, debugging, writing, math, systems, and general knowledge."
+      placeholder="Ask anything..."
       quickPrompts={[
-        { label: "Device Connectivity", prompt: "Help me troubleshoot device connection problems in FluxRemote." },
-        { label: "Host Problems", prompt: "What should I check if the FluxRemote host is offline or unreachable?" },
-        { label: "Keyboard & Mouse", prompt: "Help me fix keyboard and mouse input issues in FluxRemote." },
-        { label: "Screen Sharing", prompt: "Help me fix screen sharing or display issues in FluxRemote." },
-        { label: "Network", prompt: "Help me diagnose network or latency issues affecting FluxRemote." },
-        { label: "Authentication", prompt: "Help me resolve authentication or permission problems in FluxRemote." },
+        { label: "Explain Screen", prompt: "Explain what is happening on the screen and what I should focus on next." },
+        { label: "Diagnose", prompt: "Diagnose the issue I’m seeing in this session and suggest practical next steps." },
+        { label: "Generate Code", prompt: "Generate a clean, production-ready code example for the task I’m working on." },
+        { label: "Translate", prompt: "Translate this request or code snippet into the target language and explain it clearly." },
+        { label: "Summarize", prompt: "Summarize the current situation, key details, and the best next action." },
       ]}
       compact={compact}
-      className="h-full rounded-none border-0 shadow-none"
+      className=""
     />
   );
 }

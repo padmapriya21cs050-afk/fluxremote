@@ -1,1 +1,70 @@
 @import "tailwindcss";
+
+@keyframes assistant-float-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.35), 0 20px 45px rgba(15, 23, 42, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 12px rgba(56, 189, 248, 0), 0 24px 60px rgba(15, 23, 42, 0.55);
+  }
+}
+
+@keyframes assistant-slide-in {
+  from {
+    transform: translateX(32px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes assistant-fade-in {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes assistant-bounce {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.7;
+  }
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.assistant-float-button {
+  animation: assistant-float-pulse 5s ease-in-out infinite;
+}
+
+.assistant-panel-enter {
+  animation: assistant-slide-in 220ms ease-out;
+}
+
+.assistant-message-enter {
+  animation: assistant-fade-in 220ms ease-out;
+}
+
+.assistant-typing-dot {
+  animation: assistant-bounce 1.3s ease-in-out infinite;
+}
+
+.assistant-typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.assistant-typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
