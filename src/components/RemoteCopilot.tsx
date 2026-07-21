@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Bot, Check, Copy, Loader, Sparkles, Trash2, X } from "lucide-react";
+import { ArrowUp, Bot, Check, Copy, Loader, Plus, Sparkles, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -108,8 +108,10 @@ export default function RemoteCopilot({
   const [error, setError] = useState("");
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isOpen, setIsOpen] = useState(false);
+  const [screenshot, setScreenshot] = useState<{ name: string; preview: string; type: string; size: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const sessionSummary = useMemo(
     () => ({
@@ -190,14 +192,17 @@ export default function RemoteCopilot({
 
   const sendMessage = async (messageText?: string) => {
     const trimmed = (messageText ?? draft).trim();
-    if (!trimmed || isLoading) {
+    if (!trimmed && !screenshot) {
       return;
     }
 
-    const userMessage: ChatMessage = { id: createId(), role: "user", content: trimmed };
-    const nextMessages: ChatMessage[] = [...messages, userMessage];
+    const effectiveMessage = `${trimmed}${screenshot ? `\n\n[Attached screenshot: ${screenshot.name}]` : ""}`.trim();
+    const nextMessagesWithAttachment: ChatMessage[] = [
+      ...messages,
+      { id: createId(), role: "user", content: effectiveMessage },
+    ];
     const assistantMessageId = createId();
-    const streamingMessages: ChatMessage[] = [...nextMessages, { id: assistantMessageId, role: "assistant", content: "" }];
+    const streamingMessages: ChatMessage[] = [...nextMessagesWithAttachment, { id: assistantMessageId, role: "assistant", content: "" }];
 
     setMessages(streamingMessages);
     setDraft("");
@@ -205,14 +210,25 @@ export default function RemoteCopilot({
     setIsLoading(true);
 
     try {
+      const requestContext = screenshot
+        ? {
+            ...sessionSummary,
+            screenshot: {
+              filename: screenshot.name,
+              type: screenshot.type,
+              size: screenshot.size,
+            },
+          }
+        : sessionSummary;
+
       const response = await fetch(`${apiBaseUrl}/api/copilot/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: trimmed,
-          history: nextMessages.map(({ role, content }) => ({ role, content })),
+          message: effectiveMessage,
+          history: nextMessagesWithAttachment.map(({ role, content }) => ({ role, content })),
           session_id: sessionId,
-          context: sessionSummary,
+          context: requestContext,
         }),
       });
 
@@ -260,6 +276,9 @@ export default function RemoteCopilot({
       setMessages((current) =>
         current.map((message) => (message.id === assistantMessageId ? { ...message, content: reply } : message))
       );
+      if (screenshot) {
+        removeScreenshot();
+      }
     } catch (err) {
       const fallback = "The AI service is temporarily unavailable. Please try again in a moment.";
       setMessages((current) =>
@@ -268,6 +287,46 @@ export default function RemoteCopilot({
       setError(err instanceof Error ? err.message : fallback);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const triggerScreenshotPicker = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleScreenshotSelect = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const preview = String(reader.result || "");
+      setScreenshot({
+        name: file.name,
+        preview,
+        type: file.type,
+        size: file.size,
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const removeScreenshot = () => {
+    setScreenshot(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboardItems = Array.from(event.clipboardData?.items ?? []);
+    const imageItem = clipboardItems.find((item) => item.type.startsWith("image/"));
+
+    if (!imageItem) {
+      return;
+    }
+
+    event.preventDefault();
+    const file = imageItem.getAsFile();
+    if (file) {
+      handleScreenshotSelect(file);
     }
   };
 
@@ -346,7 +405,54 @@ export default function RemoteCopilot({
                 </button>
               ))}
             </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={triggerScreenshotPicker}
+                className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1.5 text-[11px] font-semibold text-slate-300 transition hover:border-sky-500/40 hover:bg-sky-500/10 hover:text-sky-200"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Add screenshot
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    handleScreenshotSelect(file);
+                  }
+                }}
+              />
+            </div>
           </div>
+
+          {screenshot && (
+            <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-900/95 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-white">Screenshot attached</p>
+                  <p className="text-xs text-slate-500">{screenshot.name} • {(screenshot.size / 1024).toFixed(1)} KB</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={removeScreenshot}
+                  className="rounded-full border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs font-semibold text-slate-300 transition hover:border-slate-500 hover:text-white"
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="mt-3 overflow-hidden rounded-xl border border-slate-800 bg-slate-950">
+                <img
+                  src={screenshot.preview}
+                  alt="Screenshot preview"
+                  className="h-48 w-full object-contain"
+                />
+              </div>
+            </div>
+          )}
 
           <div ref={scrollRef} className="flex-1 overflow-y-auto overscroll-contain px-4 py-4">
             <div className="space-y-3">
@@ -431,6 +537,7 @@ export default function RemoteCopilot({
                 ref={textareaRef}
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
+                onPaste={handlePaste}
                 onKeyDown={handleKeyDown}
                 rows={compact ? 2 : 3}
                 placeholder={placeholder}
